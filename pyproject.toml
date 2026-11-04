@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "connectinator"
+version = "0.1.0"
+description = "Local network service discovery and quick VNC connections"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["PySide6>=6.10,<7", "QtAwesome>=1.4.2,<2"]
+
+[project.scripts]
+connectinator = "connectinator.app:main"
+
+[tool.setuptools.packages.find]
+include = ["connectinator*"]
