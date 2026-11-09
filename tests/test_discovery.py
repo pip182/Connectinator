@@ -3,13 +3,26 @@ import ctypes
 import json
 import socket
 import sys
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from connectinator.discovery import _send_arp, arp_targets_for, discover_arp
+from connectinator.discovery import _send_arp, arp_targets_for, discover_arp, worker_files
 
 
 class ArpScopeTests(unittest.TestCase):
+    def test_windowed_worker_uses_files_without_standard_streams(self):
+        with tempfile.TemporaryDirectory() as directory:
+            request, result = Path(directory) / "request.json", Path(directory) / "result.jsonl"
+            request.write_text(json.dumps({"10.0.0.2": "10.0.0.1"}), encoding="utf-8")
+            with patch("connectinator.discovery.sys.stdin", None), \
+                 patch("connectinator.discovery.sys.stdout", None), \
+                 patch("connectinator.discovery._send_arp", return_value="AA:BB:CC:DD:EE:FF"):
+                worker_files(str(request), str(result))
+            self.assertEqual(json.loads(result.read_text(encoding="utf-8")),
+                             {"address": "10.0.0.2", "mac": "AA:BB:CC:DD:EE:FF"})
+
     def test_only_on_link_unicast_targets_and_longest_prefix(self):
         interfaces = [("10.0.0.1", 24), ("10.0.0.129", 25), ("100.64.0.1", 32), ("127.0.0.1", 8)]
         targets = ["10.0.0.2", "10.0.0.130", "10.0.0.255", "10.0.0.0", "10.0.0.1",
@@ -33,6 +46,25 @@ class ArpScopeTests(unittest.TestCase):
 
 
 class ArpProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_frozen_helper_runs_executable_instead_of_python_module(self):
+        process = self.process()
+        found, warnings = [], []
+
+        async def spawn(*args, **kwargs):
+            self.assertEqual(args[1], "--arp-worker")
+            self.assertNotIn("-m", args)
+            request, result = Path(args[2]), Path(args[3])
+            self.assertEqual(json.loads(request.read_text(encoding="utf-8")), {"10.0.0.2": "10.0.0.1"})
+            result.write_text(json.dumps({"address": "10.0.0.2", "mac": "AA:BB:CC:DD:EE:FF"}) + "\n", encoding="utf-8")
+            return process
+
+        with patch("connectinator.discovery.sys.platform", "win32"), \
+             patch("connectinator.discovery.sys.frozen", True, create=True), \
+             patch("connectinator.discovery.asyncio.create_subprocess_exec", side_effect=spawn):
+            await discover_arp({"10.0.0.2": "10.0.0.1"}, lambda *args: found.append(args), warnings.append)
+        self.assertEqual(found, [("10.0.0.2", "AA:BB:CC:DD:EE:FF")])
+        self.assertFalse(warnings)
+
     def process(self):
         process = MagicMock()
         process.stdin.drain = AsyncMock()

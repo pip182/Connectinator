@@ -11,9 +11,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import ctypes
 import ipaddress
 import json
+from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
+import time
 from typing import Callable
 
 
@@ -67,9 +70,72 @@ def _worker() -> None:
             print(json.dumps({"address": futures[future], "mac": future.result()}), flush=True)
 
 
+def worker_files(request_path: str, result_path: str) -> None:
+    """Windowed executables have no Python stdin/stdout; exchange JSON through files."""
+    targets = json.loads(Path(request_path).read_text(encoding="utf-8"))
+    with Path(result_path).open("w", encoding="utf-8") as output, ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_send_arp, address, source): address for address, source in targets.items()}
+        for future in as_completed(futures):
+            output.write(json.dumps({"address": futures[future], "mac": future.result()}) + "\n")
+            output.flush()
+
+
+async def _discover_frozen(targets, on_device, on_warning):
+    process = None
+    with tempfile.TemporaryDirectory(prefix="connectinator-arp-") as directory:
+        request = Path(directory) / "request.json"
+        result = Path(directory) / "result.jsonl"
+        request.write_text(json.dumps(targets), encoding="utf-8")
+        result.touch()
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "--arp-worker", str(request), str(result),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            last_activity = time.monotonic()
+            partial = ""
+            with result.open(encoding="utf-8") as stream:
+                while True:
+                    # Only the helper appends; hold incomplete lines for the next read.
+                    partial += stream.read()
+                    while "\n" in partial:
+                        line, partial = partial.split("\n", 1)
+                        value = json.loads(line)
+                        last_activity = time.monotonic()
+                        if value["address"] in targets and value["mac"]:
+                            on_device(value["address"], value["mac"])
+                    if process.returncode is not None:
+                        # Reap output flushed just before exit on the next iteration.
+                        partial += stream.read()
+                        for line in partial.splitlines():
+                            value = json.loads(line)
+                            if value["address"] in targets and value["mac"]:
+                                on_device(value["address"], value["mac"])
+                        if process.returncode:
+                            on_warning("ARP helper failed; TCP and ping results are still available.")
+                        break
+                    if time.monotonic() - last_activity > 30:
+                        raise TimeoutError("ARP helper stopped responding")
+                    await asyncio.sleep(0.05)
+        except (OSError, TimeoutError, ValueError, KeyError) as exc:
+            on_warning(f"ARP discovery unavailable ({type(exc).__name__}); TCP/ping continue.")
+        finally:
+            if process is not None and process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            if process is not None:
+                await process.wait()
+
+
 async def discover_arp(targets: dict[str, str], on_device: Callable[[str, str], None],
                        on_warning: Callable[[str], None]) -> None:
     if sys.platform != "win32" or not targets:
+        return
+    if getattr(sys, "frozen", False):
+        await _discover_frozen(targets, on_device, on_warning)
         return
     process = None
     try:

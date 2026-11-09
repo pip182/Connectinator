@@ -10,8 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["PySide6>=6.10,<7", "QtAwesome>=1.4.2,<2"]
 
+[project.optional-dependencies]
+build = ["PyInstaller>=6.17,<7"]
+
 [project.scripts]
-connectinator = "connectinator.app:main"
+connectinator = "connectinator.launcher:main"
 
 [tool.setuptools.packages.find]
 include = ["connectinator*"]

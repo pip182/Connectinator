@@ -6,11 +6,13 @@ import asyncio
 from dataclasses import replace
 import ipaddress
 import json
+import sqlite3
 from pathlib import Path
 import sys
+import shutil
 import threading
 
-from PySide6.QtCore import QSettings, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QProcess, QSettings, QStandardPaths, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtWidgets import (
@@ -24,10 +26,12 @@ from PySide6.QtWidgets import (
 from .scanner import COMMON_PORTS, VNC_PORTS, Device, Service, parse_ports, parse_targets, scan
 from .viewer import find_viewer, launch
 from .discovery import arp_targets_for
-from .inventory import ADDRESS, NAME, SERVICES, DeviceModel, DeviceFilter
+from .inventory import ADDRESS, NAME, SERVICES, DeviceModel, DeviceFilter, display_time
 from .names import HostnameResolver
 from .icons import icon
 from .theme import ComboBox, apply_theme
+from .storage import InventoryStore
+from .monitor import Availability, check_devices
 
 
 def local_networks() -> list[tuple[str, str]]:
@@ -98,6 +102,25 @@ class ScanThread(QThread):
             self.failed.emit(self.error)
 
 
+class AvailabilityThread(QThread):
+    result = Signal(object)
+    notice = Signal(str)
+
+    def __init__(self, devices, timeout, use_ping, targets, parent=None):
+        super().__init__(parent)
+        self.devices, self.timeout, self.use_ping, self.targets = devices, timeout, use_ping, targets
+        self.cancel = threading.Event()
+        self.error = ""
+
+    def run(self):
+        try:
+            asyncio.run(check_devices(self.devices, self.timeout, self.cancel, self.result.emit,
+                                      use_ping=self.use_ping, arp_targets=self.targets,
+                                      on_warning=self.notice.emit))
+        except Exception as exc:
+            self.error = str(exc)
+
+
 class ViewerDialog(QDialog):
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
@@ -145,10 +168,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = settings if settings is not None else QSettings("Connectinator", "Connectinator")
         self.worker: ScanThread | None = None
+        self.availability_worker: AvailabilityThread | None = None
+        self.scan_after_monitor = False
         self.closing = False
         self.pending_devices: dict[str, Device] = {}
         self.pending_names: dict[str, str] = {}
         self.pending_progress = None
+        self.pending_availability: dict[str, Availability] = {}
+        self.dirty: set[str] = set()
+        self.store = None
         self.scan_warnings: list[str] = []
         try:
             raw = json.loads(self.settings.value("favorites", "{}"))
@@ -163,6 +191,7 @@ class MainWindow(QMainWindow):
             self.labels = {str(ipaddress.IPv4Address(a)): str(label)[:100] for a, label in raw.items()}
         except (ValueError, TypeError, AttributeError):
             self.labels = {}
+        self.tailscale_process = None
         self.model = DeviceModel(self.favorites, self.labels, self)
         self.devices, self.seen = self.model.devices, self.model.seen
         self.proxy = DeviceFilter(self)
@@ -170,15 +199,25 @@ class MainWindow(QMainWindow):
         self.resolver = HostnameResolver(self)
         self.resolver.resolved.connect(self.hostname_found)
         self.setWindowTitle("Connectinator · Network & VNC discovery")
-        self.setWindowIcon(icon("network-wired", "#58dfb3"))
+        self.setWindowIcon(icon("network-wired", "#6fd36f"))
         self.resize(1180, 800)
         self.setMinimumSize(900, 640)
         self.build_ui()
+        self.load_inventory()
         self.load_saved()
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setInterval(100)
         self.refresh_timer.timeout.connect(self.flush_updates)
         self.refresh_timer.start()
+        self.persist_timer = QTimer(self)
+        self.persist_timer.setSingleShot(True)
+        self.persist_timer.setInterval(1000)
+        self.persist_timer.timeout.connect(self.save_inventory)
+        self.monitor_timer = QTimer(self)
+        self.monitor_timer.setSingleShot(True)
+        self.monitor_timer.timeout.connect(self.start_monitor)
+        if self.monitor_enabled.isChecked() and self.devices:
+            self.monitor_timer.start(0)
 
     def build_ui(self):
         root = QWidget()
@@ -191,9 +230,9 @@ class MainWindow(QMainWindow):
         title.setObjectName("title")
         heading.addWidget(title)
         heading.addStretch()
-        self.viewer_button = QPushButton("Viewer settings")
+        self.viewer_button = QPushButton("Settings")
         self.viewer_button.setIcon(icon("gear"))
-        self.viewer_button.clicked.connect(self.viewer_settings)
+        self.viewer_button.clicked.connect(lambda: self.settings_dialog.exec())
         heading.addWidget(self.viewer_button)
         self.export_button = QPushButton("Export JSON")
         self.export_button.setIcon(icon("file-export"))
@@ -219,6 +258,11 @@ class MainWindow(QMainWindow):
         all_networks.setIcon(icon("network-wired"))
         all_networks.clicked.connect(self.select_all_networks)
         networks.addWidget(all_networks)
+        self.tailscale_button = QPushButton("Tailscale devices")
+        self.tailscale_button.setIcon(icon("network-wired"))
+        self.tailscale_button.setToolTip("Fill Targets with online Tailscale peers and label them by name")
+        self.tailscale_button.clicked.connect(self.load_tailscale)
+        networks.addWidget(self.tailscale_button)
         panel_layout.addLayout(networks)
 
         target_row = QHBoxLayout()
@@ -232,7 +276,7 @@ class MainWindow(QMainWindow):
         self.scan_button.clicked.connect(self.start_scan)
         target_row.addWidget(self.scan_button)
         self.stop_button = QPushButton("Stop")
-        self.stop_button.setIcon(icon("stop", "#f2a994"))
+        self.stop_button.setIcon(icon("stop", "#f07178"))
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_scan)
         target_row.addWidget(self.stop_button)
@@ -260,36 +304,62 @@ class MainWindow(QMainWindow):
         self.ping.setChecked(True)
         options.addWidget(self.profile)
         options.addWidget(self.ports, 1)
-        options.addWidget(QLabel("Connect"))
-        options.addWidget(self.timeout)
-        options.addWidget(QLabel("Greeting"))
-        options.addWidget(self.greeting_timeout)
         panel_layout.addLayout(options)
-        discovery = QHBoxLayout()
-        discovery.addWidget(self.ping)
         self.arp = QCheckBox("ARP discovery (local subnet)")
         self.arp.setEnabled(sys.platform == "win32")
         self.arp.setChecked(sys.platform == "win32")
         self.arp.setToolTip("Windows: actively resolve local IPv4/MAC addresses even if ping is blocked. Skips routed targets.")
-        discovery.addWidget(self.arp)
         self.resolve_names = QCheckBox("Resolve hostnames")
         self.resolve_names.setChecked(self.settings.value("scan/resolve_names", True, type=bool))
         self.resolve_names.toggled.connect(self.toggle_name_resolution)
-        discovery.addWidget(self.resolve_names)
-        discovery.addStretch()
-        panel_layout.addLayout(discovery)
         layout.addWidget(scan_panel)
         if not self.targets.text() and self.network.count() > 1:
             self.network.setCurrentIndex(1)
 
         self.summary = QLabel()
         self.summary.setObjectName("summary")
-        layout.addWidget(self.summary)
+        self.monitor_enabled = QCheckBox("Check saved devices at startup and periodically")
+        self.monitor_enabled.setChecked(self.settings.value("monitor/enabled", True, type=bool))
+        self.monitor_enabled.toggled.connect(self.monitor_preferences_changed)
+        self.monitor_interval = QDoubleSpinBox()
+        self.monitor_interval.setDecimals(0)
+        self.monitor_interval.setRange(15, 3600)
+        self.monitor_interval.setSingleStep(15)
+        self.monitor_interval.setValue(float(self.settings.value("monitor/interval", 60)))
+        self.monitor_interval.setSuffix(" s")
+        self.monitor_interval.valueChanged.connect(self.monitor_preferences_changed)
+        self.check_button = QPushButton("Check now")
+        self.check_button.setIcon(icon("arrows-rotate"))
+        self.check_button.clicked.connect(self.start_monitor)
+        heading.insertWidget(heading.indexOf(self.viewer_button), self.check_button)
+
+        # Hosts the scan/monitoring option widgets; kept alive so the rest of the app can read them.
+        self.settings_dialog = QDialog(self)
+        self.settings_dialog.setWindowTitle("Settings")
+        form = QFormLayout(self.settings_dialog)
+        form.addRow("Connect timeout", self.timeout)
+        form.addRow("VNC greeting timeout", self.greeting_timeout)
+        form.addRow(self.ping)
+        form.addRow(self.arp)
+        form.addRow(self.resolve_names)
+        form.addRow(self.monitor_enabled)
+        form.addRow("Check every", self.monitor_interval)
+        viewer_button = QPushButton("Viewer settings…")
+        viewer_button.setIcon(icon("gear"))
+        viewer_button.clicked.connect(self.viewer_settings)
+        form.addRow(viewer_button)
+        close_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_buttons.rejected.connect(self.settings_dialog.accept)
+        form.addRow(close_buttons)
         filters = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("Filter by IP, hostname, label, MAC, service, or port…")
         self.search.textChanged.connect(self.filter_rows)
         filters.addWidget(self.search, 1)
+        self.status_filter = ComboBox()
+        self.status_filter.addItems(["All devices", "Online", "Offline", "Unchecked"])
+        self.status_filter.currentIndexChanged.connect(self.filter_rows)
+        filters.addWidget(self.status_filter)
         self.only_vnc = QCheckBox("VNC only")
         self.only_vnc.toggled.connect(self.filter_rows)
         filters.addWidget(self.only_vnc)
@@ -307,7 +377,7 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().hide()
         self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        for column, width in enumerate((38, 130, 170, 150, 160, 170, 240)):
+        for column, width in enumerate((35, 125, 145, 85, 132, 100, 145, 220, 135)):
             self.table.setColumnWidth(column, width)
         self.table.horizontalHeader().setSectionResizeMode(SERVICES, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setMinimumSectionSize(35)
@@ -325,7 +395,7 @@ class MainWindow(QMainWindow):
 
         connection = QHBoxLayout()
         self.favorite_button = QPushButton("Save favorite")
-        self.favorite_button.setIcon(icon("fa6.star", "#f2ce75"))
+        self.favorite_button.setIcon(icon("fa6.star", "#e8b04a"))
         self.favorite_button.setEnabled(False)
         self.favorite_button.clicked.connect(self.toggle_favorite)
         connection.addWidget(self.favorite_button)
@@ -339,6 +409,11 @@ class MainWindow(QMainWindow):
         self.endpoint = ComboBox()
         self.endpoint.setMinimumWidth(240)
         connection.addWidget(self.endpoint)
+        self.view_only = QCheckBox("View only")
+        self.view_only.setToolTip("Open the viewer without sending keyboard or mouse input")
+        self.view_only.setChecked(self.settings.value("viewer/view_only", False, type=bool))
+        self.view_only.toggled.connect(lambda checked: self.settings.setValue("viewer/view_only", checked))
+        connection.addWidget(self.view_only)
         self.connect_button = QPushButton("Connect to VNC")
         self.connect_button.setIcon(icon("desktop", "#ffffff"))
         self.connect_button.setObjectName("primary")
@@ -355,7 +430,10 @@ class MainWindow(QMainWindow):
         self.status = QLabel("Ready · TCP services are inferred by port unless marked verified.")
         self.status.setObjectName("muted")
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status, 1)
+        status_row.addWidget(self.summary)
+        layout.addLayout(status_row)
 
     def select_network(self, index):
         if target := self.network.itemData(index):
@@ -364,15 +442,161 @@ class MainWindow(QMainWindow):
     def select_all_networks(self):
         self.targets.setText(", ".join(self.network.itemData(i) for i in range(1, self.network.count())))
 
+    def load_tailscale(self):
+        if self.tailscale_process is not None:
+            return
+        program = shutil.which("tailscale") or r"C:\Program Files\Tailscale\tailscale.exe"
+        process = QProcess(self)
+        process.finished.connect(self.tailscale_finished)
+        process.errorOccurred.connect(lambda _e: self.tailscale_finished(-1, None))
+        self.tailscale_process = process
+        self.tailscale_button.setEnabled(False)
+        QTimer.singleShot(5000, lambda: process.kill() if self.tailscale_process is process else None)
+        process.start(program, ["status", "--json"])
+
+    def tailscale_finished(self, code, _status):
+        process, self.tailscale_process = self.tailscale_process, None
+        self.tailscale_button.setEnabled(True)
+        if process is None:
+            return
+        try:
+            if code != 0:
+                raise ValueError("tailscale status failed (is Tailscale installed and running?)")
+            peers = json.loads(bytes(process.readAllStandardOutput()).decode("utf-8", "replace")).get("Peer") or {}
+            found = []
+            for peer in peers.values():
+                if not peer.get("Online"):
+                    continue
+                addresses = [a for a in peer.get("TailscaleIPs", []) if "." in a]
+                if addresses:
+                    host = peer.get("HostName") or ""
+                    dns = (peer.get("DNSName") or "").rstrip(".")
+                    found.append((str(ipaddress.IPv4Address(addresses[0])), dns or host, host))
+        except (ValueError, TypeError, AttributeError) as exc:
+            QMessageBox.warning(self, "Tailscale", str(exc))
+            return
+        finally:
+            process.deleteLater()
+        if not found:
+            self.status.setText("No online Tailscale peers found.")
+            return
+        for address, name, host in found:
+            # Don't overwrite custom labels; upgrade ones this button set earlier (bare host name).
+            if name and self.labels.get(address, host) == host and self.labels.get(address) != name:
+                self.set_label(address, name)
+        self.targets.setText(", ".join(address for address, _, _ in found))
+        self.status.setText(f"{len(found)} online Tailscale peers added to Targets — press Scan network.")
+
     def load_saved(self):
         self.model.apply([Device(address, [Service(p, "VNC") for p in ports])
-                          for address, ports in self.favorites.items()], observed=False)
+                          for address, ports in self.favorites.items() if address not in self.devices], observed=False)
         self.proxy.invalidate()
         self.update_summary()
+
+    def load_inventory(self):
+        if self.settings.format() == QSettings.Format.IniFormat:
+            path = Path(self.settings.fileName()).with_suffix(".devices.sqlite3")
+        else:
+            path = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)) / "devices.sqlite3"
+        try:
+            self.store = InventoryStore(path)
+            devices = self.store.load()
+            for device in devices:
+                if device.label:
+                    self.labels.setdefault(device.address, device.label)
+            self.model.apply(devices, observed=False)
+            if devices:
+                self.status.setText(f"Loaded {len(devices)} saved devices · availability is unchecked until refreshed.")
+        except (OSError, sqlite3.Error) as exc:
+            if self.store:
+                self.store.close()
+                self.store = None
+            self.status.setText(f"Could not load saved inventory: {exc}")
+
+    def mark_dirty(self, addresses):
+        self.dirty.update(addresses)
+        if self.store and not self.persist_timer.isActive():
+            self.persist_timer.start()
+
+    @Slot()
+    def save_inventory(self):
+        if not self.store or not self.dirty:
+            return
+        addresses = self.dirty & self.devices.keys()
+        try:
+            self.store.save([self.devices[a] for a in addresses])
+            self.dirty.difference_update(addresses)
+        except (OSError, sqlite3.Error) as exc:
+            self.status.setText(f"Could not save inventory: {exc}")
+            if not self.closing:
+                self.persist_timer.start(3000)
+
+    def monitor_preferences_changed(self, *_):
+        self.settings.setValue("monitor/enabled", self.monitor_enabled.isChecked())
+        self.settings.setValue("monitor/interval", self.monitor_interval.value())
+        self.monitor_timer.stop()
+        if not self.monitor_enabled.isChecked():
+            if self.availability_worker:
+                self.availability_worker.cancel.set()
+        elif not self.availability_worker and not self.worker:
+            self.monitor_timer.start(0)
+
+    def schedule_monitor(self):
+        if not self.closing and self.monitor_enabled.isChecked():
+            self.monitor_timer.start(int(self.monitor_interval.value() * 1000))
+
+    @Slot()
+    def start_monitor(self):
+        self.monitor_timer.stop()
+        if self.closing or self.worker or self.availability_worker:
+            return
+        self.flush_updates()
+        if not self.devices:
+            self.schedule_monitor()
+            return
+        devices = list(self.devices.values())
+        targets = arp_targets_for(list(self.devices), local_interfaces()) if self.arp.isChecked() else {}
+        self.availability_worker = AvailabilityThread(devices, self.timeout.value(), self.ping.isChecked(), targets, self)
+        self.availability_worker.result.connect(self.availability_found)
+        self.availability_worker.notice.connect(self.status.setText)
+        self.availability_worker.finished.connect(self.monitor_finished)
+        self.check_button.setEnabled(False)
+        self.status.setText(f"Checking availability of {len(devices)} saved devices…")
+        self.availability_worker.start()
+
+    @Slot(object)
+    def availability_found(self, result):
+        self.pending_availability[result.address] = result
+
+    @Slot()
+    def monitor_finished(self):
+        worker = self.availability_worker
+        if worker is None:
+            return
+        self.flush_updates()
+        if worker.error:
+            self.status.setText(f"Availability check failed: {worker.error}")
+        elif not worker.cancel.is_set():
+            self.status.setText(f"Availability updated · {self.model.online_count} online · {self.model.offline_count} offline (no response).")
+        self.availability_worker = None
+        worker.deleteLater()
+        self.check_button.setEnabled(True)
+        if self.closing:
+            self.close()
+        elif self.scan_after_monitor:
+            self.scan_after_monitor = False
+            self.start_scan()
+        else:
+            self.schedule_monitor()
 
     @Slot()
     def start_scan(self):
         if self.worker is not None:
+            return
+        if self.availability_worker:
+            self.scan_after_monitor = True
+            self.availability_worker.cancel.set()
+            self.status.setText("Stopping availability check before scanning…")
             return
         try:
             addresses = parse_targets(self.targets.text())
@@ -386,17 +610,18 @@ class MainWindow(QMainWindow):
                            ("resolve_names", self.resolve_names.isChecked())):
             self.settings.setValue(f"scan/{key}", value)
         self.resolver.cancel()
-        self.pending_devices.clear()
-        self.pending_names.clear()
+        self.monitor_timer.stop()
+        self.flush_updates()
         self.pending_progress = None
         self.scan_warnings.clear()
-        self.model.clear()
+        self.seen.clear()
+        self.model.confirmed = 0
         self.model.scanning = True
-        self.load_saved()
         self.progress.setRange(0, len(addresses))
         self.progress.setValue(0)
         self.status.setText(f"Scanning {len(addresses)} hosts × {len(ports)} TCP ports…")
         self.scan_button.setEnabled(False)
+        self.check_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         arp_targets = arp_targets_for(addresses, local_interfaces()) if self.arp.isChecked() else {}
         self.worker = ScanThread(addresses, ports, self.timeout.value(), self.ping.isChecked(), self,
@@ -452,9 +677,12 @@ class MainWindow(QMainWindow):
         self.show_device()
         worker.deleteLater()
         self.scan_button.setEnabled(True)
+        self.check_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         if self.closing:
             self.close()
+        else:
+            self.schedule_monitor()
 
     @Slot(object)
     def add_device(self, device: Device):
@@ -474,22 +702,52 @@ class MainWindow(QMainWindow):
             if self.worker and not self.worker.cancel.is_set() and not self.worker.error:
                 suffix = " · finishing discovery" if completed == total else ""
                 self.status.setText(f"Scanning · {completed} / {total} hosts checked{suffix}")
-        if not self.pending_devices and not self.pending_names:
+        if not self.pending_devices and not self.pending_names and not self.pending_availability:
             return
         selected = self.selected()
         address = selected.address if selected else None
         updates, self.pending_devices = self.pending_devices, {}
         names, self.pending_names = self.pending_names, {}
-        for target, name in names.items():
-            device = updates.get(target) or self.devices.get(target)
-            if device:
-                updates[target] = replace(device, hostname=name)
+        availability, self.pending_availability = self.pending_availability, {}
         self.model.apply(list(updates.values()))
+        statuses = []
+        for target, result in availability.items():
+            device = self.devices.get(target)
+            if device:
+                if result.online:
+                    # Auto-verify: a VNC port that answered with an RFB greeting is verified;
+                    # one that accepted TCP without a greeting loses any stale verification.
+                    services = [replace(s, verified=s.port in result.verified_vnc)
+                                if s.name == "VNC" and s.port in result.probed_vnc else s
+                                for s in device.services]
+                    if result.verified_vnc:
+                        self.model.seen.add(target)  # counts as verified this session
+                else:
+                    services = [replace(s, verified=False) for s in device.services]
+                statuses.append(replace(device, online=result.online, last_checked=result.checked_at,
+                                        last_seen=result.checked_at if result.online else device.last_seen,
+                                        mac=result.mac or device.mac, services=services))
+        self.model.apply(statuses, observed=False)
+        named = []
+        for target, name in names.items():
+            device = self.devices.get(target)
+            if device:
+                named.append(replace(device, hostname=name))
+        self.model.apply(named, observed=False)
+        scrollbar = self.table.verticalScrollBar()
+        scroll = scrollbar.value()
         self.proxy.invalidate()
         if address:
-            self.select_address(address)
+            # Re-select without letting the view auto-scroll back to the selected row.
+            self.table.setAutoScroll(False)
+            try:
+                self.select_address(address)
+            finally:
+                self.table.setAutoScroll(True)
+        scrollbar.setValue(scroll)
         self.update_summary()
         self.show_device()
+        self.mark_dirty(set(updates) | set(names) | set(availability))
         if self.resolve_names.isChecked() and not self.closing and not (self.worker and self.worker.cancel.is_set()):
             for target in updates:
                 self.resolver.lookup(target)
@@ -504,11 +762,12 @@ class MainWindow(QMainWindow):
                 self.resolver.lookup(address)
 
     def update_summary(self):
-        self.summary.setText(f"{len(self.seen)} devices found     ·     {self.model.confirmed} verified VNC hosts     ·     {len(self.favorites)} favorites")
+        self.summary.setText(f"{len(self.devices)} saved  ·  {self.model.online_count} online  ·  "
+                             f"{self.model.offline_count} offline  ·  {self.model.confirmed} verified VNC")
 
     def filter_rows(self):
         selected = self.selected()
-        self.proxy.set_filters(self.search.text(), self.only_vnc.isChecked(), self.only_favorites.isChecked())
+        self.proxy.set_filters(self.search.text(), self.only_vnc.isChecked(), self.only_favorites.isChecked(), self.status_filter.currentText())
         if selected:
             self.select_address(selected.address)
         self.show_device()
@@ -541,8 +800,11 @@ class MainWindow(QMainWindow):
             return
         favorite = device.address in self.favorites
         self.favorite_button.setText("Remove favorite" if favorite else "Save favorite")
-        self.favorite_button.setIcon(icon("star" if favorite else "fa6.star", "#f2ce75"))
-        lines = [device.address, "Live scan result" if device.address in self.seen else "Saved favorite; availability has not been checked."]
+        self.favorite_button.setIcon(icon("star" if favorite else "fa6.star", "#e8b04a"))
+        state = "Online" if device.online is True else "Offline · no response to configured checks" if device.online is False else "Unchecked"
+        lines = [device.address, state, f"Last seen: {display_time(device.last_seen)}",
+                 f"Last checked: {display_time(device.last_checked)}",
+                 "Current-session scan result" if device.address in self.seen else "Saved service inventory; rescan to verify services."]
         for title, value in (("Label", device.label), ("Hostname", device.hostname), ("MAC / ARP", device.mac)):
             if value:
                 lines.append(f"{title}: {value}")
@@ -551,7 +813,7 @@ class MainWindow(QMainWindow):
                      "Service scan incomplete; these are partial results.")
         lines.append("")
         for service in device.services:
-            evidence = "protocol verified" if service.verified else "port-based guess; protocol unverified"
+            evidence = "protocol verified" if service.verified else "saved or inferred service; protocol currently unverified"
             lines.append(f"TCP {service.port} · {service.name} · {evidence}")
             if service.banner:
                 lines.append(f"  Greeting: {service.banner}")
@@ -602,6 +864,7 @@ class MainWindow(QMainWindow):
             self.labels.pop(address, None)
         self.settings.setValue("labels", json.dumps(self.labels))
         self.model.refresh(address)
+        self.mark_dirty([address])
         self.filter_rows()
 
     def viewer_settings(self):
@@ -623,7 +886,8 @@ class MainWindow(QMainWindow):
                 return
             executable = self.settings.value("viewer/path", "")
         try:
-            launch(executable, device.address, port, self.settings.value("viewer/style", "Double colon"))
+            launch(executable, device.address, port, self.settings.value("viewer/style", "Double colon"),
+                   self.view_only.isChecked())
             self.status.setText(f"Opened VNC viewer for {device.address}:{port}")
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "Could not launch viewer", str(exc))
@@ -643,13 +907,23 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export failed", str(exc))
 
     def closeEvent(self, event):
-        if self.worker is not None:
+        self.closing = True
+        self.monitor_timer.stop()
+        if self.availability_worker:
+            self.availability_worker.cancel.set()
+        if self.worker is not None or self.availability_worker is not None:
             self.closing = True
             self.stop_scan()
             event.ignore()
         else:
             self.resolver.cancel()
             self.refresh_timer.stop()
+            self.flush_updates()
+            self.persist_timer.stop()
+            self.save_inventory()
+            if self.store:
+                self.store.close()
+                self.store = None
             self.settings.sync()
             event.accept()
 

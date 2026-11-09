@@ -50,6 +50,9 @@ class Device:
     label: str = ""
     mac: str = ""
     complete: bool = True
+    online: bool | None = None
+    last_seen: str = ""
+    last_checked: str = ""
 
     @property
     def vnc(self) -> list[Service]:

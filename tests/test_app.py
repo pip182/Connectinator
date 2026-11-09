@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 
 from connectinator.app import MainWindow
 from connectinator.scanner import Device, Service
+from connectinator.monitor import Availability
 
 
 class AppTests(unittest.TestCase):
@@ -25,15 +26,17 @@ class AppTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.settings = QSettings(str(Path(self.directory.name) / "settings.ini"), QSettings.Format.IniFormat)
         self.settings.setValue("scan/resolve_names", False)
+        self.settings.setValue("monitor/enabled", False)
         self.window = MainWindow(self.settings)
 
     def tearDown(self):
         self.window.close()
         deadline = time.monotonic() + 3
-        while self.window.worker is not None and time.monotonic() < deadline:
+        while (self.window.worker is not None or self.window.availability_worker is not None) and time.monotonic() < deadline:
             self.app.processEvents()
             time.sleep(0.01)
         self.assertIsNone(self.window.worker, "Background scan did not stop")
+        self.assertIsNone(self.window.availability_worker, "Availability check did not stop")
         self.window.deleteLater()
         self.app.processEvents()
         del self.window
@@ -59,7 +62,7 @@ class AppTests(unittest.TestCase):
         self.settings.setValue("viewer/path", str(executable))
         with patch("connectinator.app.launch") as launch:
             self.window.connect_vnc()
-            launch.assert_called_once_with(str(executable), device.address, 5907, "Double colon")
+            launch.assert_called_once_with(str(executable), device.address, 5907, "Double colon", False)
         self.window.search.setText("no-match")
         self.assertFalse(self.window.connect_button.isEnabled())
 
@@ -147,6 +150,117 @@ class AppTests(unittest.TestCase):
         self.window.flush_updates()
         self.assertEqual(self.window.selected().address, "10.0.0.10")
         self.assertEqual(self.window.endpoint.currentData(), 5907)
+
+    def test_offline_keeps_services_and_last_seen_and_status_filter(self):
+        self.window.add_device(Device("10.0.0.2", [Service(5907, "VNC", True)]))
+        self.select("10.0.0.2")
+        last_seen = self.window.devices["10.0.0.2"].last_seen
+        self.window.availability_found(Availability("10.0.0.2", False, "2026-11-04T15:00:00+00:00"))
+        self.window.flush_updates()
+        device = self.window.devices["10.0.0.2"]
+        self.assertIs(device.online, False)
+        self.assertEqual(device.last_seen, last_seen)
+        self.assertEqual(device.candidates[0].port, 5907)
+        self.assertFalse(device.vnc)
+        self.window.status_filter.setCurrentText("Offline")
+        self.assertEqual(self.window.proxy.rowCount(), 1)
+        self.window.status_filter.setCurrentText("Online")
+        self.assertEqual(self.window.proxy.rowCount(), 0)
+
+    def test_startup_and_periodic_checks_use_restored_inventory(self):
+        self.window.add_device(Device("10.0.0.2", [Service(5907, "VNC", True)], hostname="shop-pc"))
+        self.window.flush_updates()
+        self.window.save_inventory()
+        self.settings.setValue("monitor/enabled", True)
+        calls = []
+
+        async def fake_check(devices, timeout, cancel, on_result, **kwargs):
+            calls.append([d.address for d in devices])
+            for device in devices:
+                on_result(Availability(device.address, True, "2026-11-04T15:00:00+00:00", "TCP"))
+
+        with patch("connectinator.app.check_devices", side_effect=fake_check):
+            other = MainWindow(self.settings)
+            try:
+                self.assertIsNone(other.devices["10.0.0.2"].online)
+                deadline = time.monotonic() + 2
+                while (not calls or other.availability_worker is not None) and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.01)
+                self.assertEqual(calls, [["10.0.0.2"]])
+                self.assertIs(other.devices["10.0.0.2"].online, True)
+                self.assertTrue(other.monitor_timer.isActive())
+                self.assertEqual(other.monitor_timer.interval(), 60000)
+                # Fire the next scheduled callback without waiting a minute.
+                other.monitor_timer.start(0)
+                deadline = time.monotonic() + 2
+                while (len(calls) < 2 or other.availability_worker is not None) and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.01)
+                self.assertEqual(len(calls), 2)
+            finally:
+                other.close()
+                other.deleteLater()
+
+    def test_monitor_close_cancels_without_losing_saved_devices(self):
+        self.window.add_device(Device("10.0.0.2", [Service(5900, "VNC")]))
+        self.window.flush_updates()
+        started = threading.Event()
+
+        async def waiting_check(devices, timeout, cancel, *args, **kwargs):
+            import asyncio
+            started.set()
+            while not cancel.is_set():
+                await asyncio.sleep(0.01)
+
+        with patch("connectinator.app.check_devices", side_effect=waiting_check):
+            self.window.start_monitor()
+            self.assertTrue(started.wait(1))
+            self.window.close()
+            deadline = time.monotonic() + 2
+            while self.window.availability_worker is not None and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            self.assertIsNone(self.window.availability_worker)
+        other = MainWindow(self.settings)
+        try:
+            self.assertIn("10.0.0.2", other.devices)
+        finally:
+            other.close()
+            other.deleteLater()
+
+    def test_full_scan_preempts_monitor_and_keeps_previous_devices(self):
+        self.window.add_device(Device("10.0.0.2", [Service(5900, "VNC")], hostname="saved-pc"))
+        self.window.flush_updates()
+        started = threading.Event()
+        order = []
+
+        async def waiting_check(devices, timeout, cancel, *args, **kwargs):
+            import asyncio
+            order.append("monitor started")
+            started.set()
+            while not cancel.is_set():
+                await asyncio.sleep(0.01)
+            order.append("monitor stopped")
+
+        async def fake_scan(addresses, ports, timeout, cancel, on_device, on_progress, **kwargs):
+            order.append("scan started")
+            on_device(Device(addresses[0], [Service(5907, "VNC", True)]))
+            on_progress(1, 1)
+
+        with patch("connectinator.app.check_devices", side_effect=waiting_check), \
+             patch("connectinator.app.scan", side_effect=fake_scan):
+            self.window.start_monitor()
+            self.assertTrue(started.wait(1))
+            self.window.targets.setText("127.0.0.1")
+            self.window.start_scan()
+            deadline = time.monotonic() + 2
+            while (len(order) < 3 or self.window.worker or self.window.availability_worker) and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+        self.assertEqual(order, ["monitor started", "monitor stopped", "scan started"])
+        self.assertEqual(self.window.devices["10.0.0.2"].hostname, "saved-pc")
+        self.assertIn("127.0.0.1", self.window.devices)
 
     def test_window_close_cancels_an_active_scan(self):
         started = threading.Event()

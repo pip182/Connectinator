@@ -10,8 +10,14 @@ if not exist ".venv\Scripts\python.exe" (
     popd
     exit /b 1
 )
-".venv\Scripts\python.exe" -m connectinator
-set "app_exit=%ERRORLEVEL%"
-if not "%app_exit%"=="0" pause
+rem Launch without a console window. Use "run.bat debug" to keep the console for errors.
+if /i "%~1"=="debug" (
+    ".venv\Scripts\python.exe" -m connectinator
+    set "app_exit=%ERRORLEVEL%"
+    if not "%app_exit%"=="0" pause
+    popd
+    exit /b %app_exit%
+)
+start "" ".venv\Scripts\pythonw.exe" -m connectinator
 popd
-exit /b %app_exit%
+exit /b 0

@@ -27,6 +27,33 @@ The environment has already been created for this checkout. To activate it optio
 Activation is unnecessary when using the full interpreter path above. On Linux/macOS,
 use `.venv/bin/python` instead of `.venv\Scripts\python.exe`.
 
+## Standalone Windows executable
+
+The single-file build is **dist/Connectinator.exe**. Copy just that file to a
+Windows x64 machine and double-click it; Python, a virtual environment, and the
+source project are not needed. Qt, the theme, and QtAwesome fonts are included.
+VNC connections still open an installed VNC viewer selected in Viewer settings.
+
+To rebuild on Windows, run **build.bat**, or use:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -e ".[build]"
+.venv\Scripts\python.exe scripts\build_exe.py
+```
+
+If an existing EXE is running, build alongside it without replacing it:
+`.venv\Scripts\python.exe scripts\build_exe.py --dist-dir dist/updated`.
+
+Build dependencies live in the optional `build` extra in `pyproject.toml`.
+The build runs a packaged self-test that renders the UI, checks icons, detects
+a fake loopback VNC server, and invokes the packaged ARP helper on loopback.
+It writes `build/exe-self-test.json` and a UI image; no LAN scan is performed.
+To run it again: `dist\Connectinator.exe --self-test build\exe-self-test.json`.
+
+The executable extracts its bundled runtime to the system temporary directory
+while running. Scan defaults, labels, and favorites remain in per-user Qt
+settings rather than beside the executable.
+
 ## Use
 
 1. Pick a detected network, click **All detected networks**, or enter targets:
@@ -71,9 +98,36 @@ the latest scan. Viewer preferences, favorites, labels, and scan defaults use pe
   coalesced by IP and applied every 100 ms, with cached display/search data. Selection
   and the chosen VNC endpoint are preserved as rows arrive or reorder.
 
+## Saved inventory and availability
+
+Discovered devices are saved automatically to a transactional SQLite database in
+the per-user Qt application data directory (`devices.sqlite3`). Saves are batched
+and flushed on close. The EXE and source app share the same inventory. New scans
+update this inventory without discarding previously discovered or offline devices.
+Addresses, known services, names, labels, MAC addresses, and timestamps survive restarts.
+
+At startup, saved devices initially appear **Unchecked** and are checked in the
+background. **Check saved devices at startup and periodically** is enabled by
+default. The default interval is **60 seconds after the previous check completes**;
+adjust it from 15 seconds to one hour, disable it, or use **Check now** manually.
+Full scans take priority and cancel an active availability check before starting.
+Checks never overlap, and stopping/closing retains results already collected.
+
+The table shows **Online**, **Offline**, and **Last seen**, with a status filter.
+Offline means no response to the configured checks, which can also indicate a
+firewall or network isolation. The previous last-seen timestamp and known VNC ports
+are preserved; you can still attempt a connection. Previously saved VNC services
+are shown as **Known** until a fresh full scan verifies the greeting again.
+
+Availability checks try up to three known TCP ports, including a VNC endpoint,
+then fall back to ping and local Windows ARP when those discovery options are
+enabled. They do not repeat the full port scan. Device reachability does not
+guarantee that a particular VNC service is accepting connections or credentials.
+
 ## Discovery limits
 
-- Scan networks you administer or have permission to inspect. Scans start only on request.
+- Scan networks you administer or have permission to inspect. Full scans start on
+  request; availability checks of saved addresses run automatically when enabled.
 - Devices are discovered through open scanned TCP ports, a successful system ping,
   or a successful local Windows ARP resolution. Devices that block these probes,
   or sit behind isolated network segments, can still be missed.
