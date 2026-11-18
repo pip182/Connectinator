@@ -1,12 +1,13 @@
 # Connectinator
 
-PySide6 desktop app for IPv4 device/service discovery and launching installed VNC viewers.
+PySide6 desktop app for IPv4 device/service discovery and launching installed remote clients.
 
-## Commands (PowerShell, project root)
-- Python: `.venv\Scripts\python.exe` (Python 3.11+); `.venv/bin/python` on Linux/macOS. Use this environment for all tools.
-- Install: `.venv\Scripts\python.exe -m pip install -e .`
-- Run: `.venv\Scripts\python.exe -m connectinator`
-- Test: `.venv\Scripts\python.exe -m unittest discover -s tests -v`
+## Commands (project root)
+- Python 3.11+ in `.venv` (`Scripts\python.exe` on Windows, `bin/python` on Linux/macOS). Use that interpreter for all tools.
+- Install: `python -m pip install -e .`
+- Run: `run.bat` / `run.sh`, or `python -m connectinator`.
+- Test: `python -m unittest discover -s tests -v`
+- Linux/macOS compat: `./run.sh compat` or `python scripts/linux_compat_runner.py` (offscreen Qt + loopback self-test).
 - EXE: `build.bat` → `dist\Connectinator.exe`; `scripts/build_exe.py` also builds natively on Linux/macOS. Includes a packaged loopback self-test.
 
 ## Map
@@ -17,8 +18,9 @@ PySide6 desktop app for IPv4 device/service discovery and launching installed VN
 - `connectinator/peers.py`: UDP broadcast beacons so running instances list each other (event-driven QUdpSocket).
 - `connectinator/storage.py`: SQLite inventory; `monitor.py`: bounded availability checks.
 - `connectinator/icons.py`: shared QtAwesome icons; create after QApplication.
-- `connectinator/theme.py`: shared control styling and themed dropdowns.
-- `connectinator/viewer.py`: viewer discovery and argument-list launch.
+- `connectinator/theme.py`: shared control styling, themed dropdowns, and `HelpButton` tooltips.
+- `connectinator/remote.py`: cross-platform client discovery and launches (VNC, SSH, RDP, Telnet, HTTP/S, WinRM).
+- `connectinator/viewer.py`: VNC viewer discovery and argument-list launch.
 - `connectinator/launcher.py`: GUI/worker dispatch; `scripts/build_exe.py`: PyInstaller build.
 - `tests/`: local fake-server and UI tests; no LAN required.
 

@@ -13,23 +13,33 @@ import shutil
 import threading
 
 from PySide6.QtCore import QProcess, QSettings, QStandardPaths, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
     QTableView, QVBoxLayout, QWidget,
 )
 
 from .scanner import COMMON_PORTS, VNC_PORTS, Device, Service, parse_ports, parse_targets, scan
-from .viewer import find_viewer, launch, resolve_executable
+from .remote import (
+    BROWSER_KINDS,
+    CLIENT_KINDS,
+    favorite_ref,
+    favorite_service,
+    find_client,
+    launch_client,
+    parse_favorite_ref,
+    service_kind,
+)
+from .viewer import resolve_executable
 from .discovery import arp_targets_for
 from .inventory import ADDRESS, NAME, SERVICES, DeviceModel, DeviceFilter, display_time
 from .names import HostnameResolver
 from .icons import icon
-from .theme import ComboBox, apply_theme
+from .theme import ComboBox, HelpButton, apply_theme, checkbox_with_help, form_label
 from .storage import InventoryStore, utc_now
 from .monitor import Availability, check_devices
 from .peers import PeerDiscovery
@@ -122,29 +132,111 @@ class AvailabilityThread(QThread):
             self.error = str(exc)
 
 
-class ViewerDialog(QDialog):
+_GETTING_STARTED = (
+    "1. Pick a network or enter Targets (IPv4, subnet, or range).\n"
+    "2. Click Scan network. Open ports appear as services are found.\n"
+    "3. Select a device, choose a Remote endpoint, and click Connect "
+    "(or double-click the row, right-click, or press Ctrl+Enter).\n"
+    "4. Use Settings for timeouts, monitoring, and Remote client settings.\n"
+    "Hover the ? icons for short tips; click them for longer explanations."
+)
+
+
+def _client_path(settings: QSettings, kind: str) -> str:
+    key = f"remote/{kind.lower()}_path"
+    configured = settings.value(key, "")
+    if configured:
+        return configured
+    if kind == "VNC":
+        return settings.value("viewer/path", "") or find_client(kind)
+    if kind in BROWSER_KINDS:
+        return settings.value("remote/browser_path", "")
+    return find_client(kind)
+
+
+class RemoteClientsDialog(QDialog):
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("VNC viewer settings")
-        self.resize(620, 190)
+        self.settings = settings
+        self.setWindowTitle("Remote client settings")
+        self.resize(640, 340)
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        self.path = QLineEdit(settings.value("viewer/path", "") or find_viewer())
+        self.paths = {}
+        for kind in sorted(CLIENT_KINDS):
+            field = QLineEdit(_client_path(settings, kind))
+            browse = QPushButton("Browse…")
+            browse.setIcon(icon("folder-open"))
+            browse.clicked.connect(lambda _checked=False, k=kind, box=field: self._browse(k, box))
+            row = QHBoxLayout()
+            row.addWidget(field, 1)
+            row.addWidget(browse)
+            tips = {
+                "VNC": "TigerVNC, TightVNC, UltraVNC, or RealVNC viewer executable.",
+                "SSH": "OpenSSH ssh or PuTTY putty.exe.",
+                "RDP": "mstsc on Windows, or xfreerdp, rdesktop, or Remmina elsewhere.",
+                "Telnet": "System telnet client if installed.",
+                "WinRM": "PowerShell or pwsh on Windows for Enter-PSSession.",
+            }
+            form.addRow(
+                form_label(
+                    f"{kind} client",
+                    tips.get(kind, "Path to the client executable."),
+                    self,
+                    detail=tips.get(kind, "Path to the client executable."),
+                ),
+                row,
+            )
+            self.paths[kind] = field
+        self.browser = QLineEdit(settings.value("remote/browser_path", ""))
+        self.browser.setPlaceholderText("Optional; leave blank for the system default browser")
         browse = QPushButton("Browse…")
         browse.setIcon(icon("folder-open"))
-        browse.clicked.connect(self.browse)
-        path_row = QHBoxLayout()
-        path_row.addWidget(self.path, 1)
-        path_row.addWidget(browse)
-        form.addRow("Viewer executable", path_row)
+        browse.clicked.connect(lambda: self._browse("Browser", self.browser))
+        row = QHBoxLayout()
+        row.addWidget(self.browser, 1)
+        row.addWidget(browse)
+        form.addRow(
+            form_label(
+                "Web browser (HTTP/HTTPS)",
+                "Optional browser for HTTP/HTTPS connects; blank uses the system default.",
+                self,
+                detail="Leave blank to use the OS default browser. Set a path to force a specific "
+                "browser executable (Chromium, Firefox, etc.).",
+            ),
+            row,
+        )
         self.style = ComboBox()
         self.style.addItems(["Double colon", "Single colon"])
         self.style.setCurrentText(settings.value("viewer/style", "Double colon"))
-        form.addRow("Address syntax", self.style)
+        form.addRow(
+            form_label(
+                "VNC address syntax",
+                "Double colon (host::5900) for TigerVNC-style viewers; single colon for others.",
+                self,
+                detail="Double colon: 10.0.0.4::5907 passes the exact TCP port to most viewers.\n"
+                "Single colon: 10.0.0.4:5907 for viewers that reject double-colon syntax.",
+            ),
+            self.style,
+        )
+        self.ssh_user = QLineEdit(settings.value("remote/ssh_user", ""))
+        self.ssh_user.setPlaceholderText("Default login name for SSH when empty")
+        form.addRow(
+            form_label(
+                "SSH username",
+                "Login name for SSH when empty uses your OS username.",
+                self,
+                detail="Passed as user@host. PuTTY uses -ssh user@host -P port; OpenSSH uses -p port user@host.",
+            ),
+            self.ssh_user,
+        )
         layout.addLayout(form)
-        hint = QLabel("Double colon: host::5900 (TigerVNC, TightVNC, UltraVNC).\n"
-                      "Select single colon if your viewer expects host:5900.\n"
-                      "Your viewer handles authentication; passwords are never stored here.")
+        hint = QLabel(
+            "Connectinator launches your installed clients with argument lists only.\n"
+            "VNC: double colon host::5900 unless your viewer expects host:5900.\n"
+            "HTTP and HTTPS open in your default browser. WinRM starts PowerShell on Windows.\n"
+            "Authentication is handled by the client; passwords are never stored here."
+        )
         hint.setWordWrap(True)
         layout.addWidget(hint)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -152,15 +244,18 @@ class ViewerDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def browse(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Choose VNC viewer", self.path.text())
+    def _browse(self, kind: str, field: QLineEdit):
+        path, _ = QFileDialog.getOpenFileName(self, f"Choose {kind} client", field.text())
         if path:
-            self.path.setText(path)
+            field.setText(path)
 
     def accept(self):
-        if not Path(resolve_executable(self.path.text().strip())).is_file():
-            QMessageBox.warning(self, "Viewer not found", "Choose an existing VNC viewer executable.")
-            return
+        for kind, field in self.paths.items():
+            text = field.text().strip()
+            executable = resolve_executable(text) if kind == "VNC" else text
+            if text and not Path(executable).is_file():
+                QMessageBox.warning(self, "Client not found", f"Choose an existing {kind} client executable.")
+                return
         super().accept()
 
 
@@ -182,10 +277,15 @@ class MainWindow(QMainWindow):
         self.scan_warnings: list[str] = []
         try:
             raw = json.loads(self.settings.value("favorites", "{}"))
-            self.favorites = {
-                str(ipaddress.IPv4Address(address)): [int(p) for p in ports if 1 <= int(p) <= 65535]
-                for address, ports in raw.items()
-            }
+            self.favorites = {}
+            for address, entries in raw.items():
+                refs = []
+                for entry in entries:
+                    parsed = parse_favorite_ref(entry)
+                    if parsed:
+                        refs.append(favorite_ref(*parsed))
+                if refs:
+                    self.favorites[str(ipaddress.IPv4Address(address))] = refs
         except (ValueError, TypeError, AttributeError):
             self.favorites = {}
         try:
@@ -200,7 +300,7 @@ class MainWindow(QMainWindow):
         self.proxy.setSourceModel(self.model)
         self.resolver = HostnameResolver(self)
         self.resolver.resolved.connect(self.hostname_found)
-        self.setWindowTitle("Connectinator · Network & VNC discovery")
+        self.setWindowTitle("Connectinator · Network discovery & remote access")
         self.setWindowIcon(icon("network-wired", "#6fd36f"))
         self.resize(1180, 800)
         self.setMinimumSize(900, 640)
@@ -238,6 +338,14 @@ class MainWindow(QMainWindow):
         title.setObjectName("title")
         heading.addWidget(title)
         heading.addStretch()
+        heading.addWidget(
+            HelpButton(
+                "How to scan and connect.",
+                self,
+                title="Getting started",
+                detail=_GETTING_STARTED,
+            )
+        )
         self.viewer_button = QPushButton("Settings")
         self.viewer_button.setIcon(icon("gear"))
         self.viewer_button.clicked.connect(lambda: self.settings_dialog.exec())
@@ -247,7 +355,7 @@ class MainWindow(QMainWindow):
         self.export_button.clicked.connect(self.export_results)
         heading.addWidget(self.export_button)
         layout.addLayout(heading)
-        subtitle = QLabel("Find devices. Discover services. Connect to VNC.")
+        subtitle = QLabel("Find devices. Discover services. Connect with VNC, SSH, RDP, and more.")
         subtitle.setObjectName("muted")
         layout.addWidget(subtitle)
 
@@ -255,7 +363,15 @@ class MainWindow(QMainWindow):
         scan_panel.setObjectName("panel")
         panel_layout = QVBoxLayout(scan_panel)
         networks = QHBoxLayout()
-        networks.addWidget(QLabel("Network"))
+        networks.addWidget(
+            form_label(
+                "Network",
+                "Pick a detected interface subnet or fill Targets manually.",
+                scan_panel,
+                detail="Each entry is a suggested /24 (or smaller) slice on a local interface. "
+                "Use All detected networks to scan every suggestion at once.",
+            )
+        )
         self.network = ComboBox()
         self.network.addItem("Choose a detected network…", "")
         for label, target in local_networks():
@@ -268,13 +384,29 @@ class MainWindow(QMainWindow):
         networks.addWidget(all_networks)
         self.tailscale_button = QPushButton("Tailscale devices")
         self.tailscale_button.setIcon(icon("network-wired"))
-        self.tailscale_button.setToolTip("Fill Targets with online Tailscale peers and label them by name")
         self.tailscale_button.clicked.connect(self.load_tailscale)
         networks.addWidget(self.tailscale_button)
+        networks.addWidget(
+            HelpButton(
+                "Load online Tailscale peers into Targets and label them.",
+                scan_panel,
+                title="Tailscale devices",
+                detail="Requires the tailscale CLI. Fills Targets with online peer IPs and applies "
+                "Tailscale names as device labels. Does not start a scan automatically.",
+            )
+        )
         panel_layout.addLayout(networks)
 
         target_row = QHBoxLayout()
-        target_row.addWidget(QLabel("Targets"))
+        target_row.addWidget(
+            form_label(
+                "Targets",
+                "IPv4 addresses, subnets, or ranges (comma-separated).",
+                scan_panel,
+                detail="Examples: 192.168.1.0/24, 10.0.0.10-10.0.0.50, 172.16.5.4\n"
+                "At most 4,096 hosts per scan. Large subnets may need a smaller slice.",
+            )
+        )
         self.targets = QLineEdit(self.settings.value("scan/targets", ""))
         self.targets.setPlaceholderText("192.168.1.0/24, 192.168.2.10-192.168.2.30, or a single IPv4 address")
         target_row.addWidget(self.targets, 1)
@@ -291,13 +423,34 @@ class MainWindow(QMainWindow):
         panel_layout.addLayout(target_row)
 
         options = QHBoxLayout()
+        options.addWidget(
+            form_label(
+                "Port profile",
+                "Which TCP ports to scan on each host.",
+                scan_panel,
+                detail="Common services + VNC: well-known ports plus VNC display range.\n"
+                "VNC only: ports 5900–5909.\n"
+                "Custom ports: your list (up to 128 ports; ranges allowed).",
+            )
+        )
         self.profile = ComboBox()
         self.profile.addItems(["Common services + VNC", "VNC only", "Custom ports"])
         self.profile.setCurrentIndex(int(self.settings.value("scan/profile", 0)))
         self.ports = QLineEdit(self.settings.value("scan/ports", "5900-5909"))
         self.ports.setEnabled(self.profile.currentIndex() == 2)
-        self.ports.setToolTip("At most 128 TCP ports; ranges supported. VNC greetings are checked on every open port.")
         self.profile.currentIndexChanged.connect(lambda index: self.ports.setEnabled(index == 2))
+        options.addWidget(self.profile)
+        options.addWidget(self.ports, 1)
+        options.addWidget(
+            HelpButton(
+                "Custom port list when Port profile is Custom (ranges, max 128).",
+                scan_panel,
+                title="Custom ports",
+                detail="Examples: 22,80,443,5900-5910\n"
+                "VNC greetings are checked on every open port in the list.",
+            )
+        )
+        panel_layout.addLayout(options)
         self.timeout = QDoubleSpinBox()
         self.timeout.setRange(0.2, 5.0)
         self.timeout.setSingleStep(0.2)
@@ -310,13 +463,9 @@ class MainWindow(QMainWindow):
         self.greeting_timeout.setSuffix(" s")
         self.ping = QCheckBox("Include ping discovery")
         self.ping.setChecked(True)
-        options.addWidget(self.profile)
-        options.addWidget(self.ports, 1)
-        panel_layout.addLayout(options)
         self.arp = QCheckBox("ARP discovery (local subnet)")
         self.arp.setEnabled(sys.platform == "win32")
         self.arp.setChecked(sys.platform == "win32")
-        self.arp.setToolTip("Windows: actively resolve local IPv4/MAC addresses even if ping is blocked. Skips routed targets.")
         self.resolve_names = QCheckBox("Resolve hostnames")
         self.resolve_names.setChecked(self.settings.value("scan/resolve_names", True, type=bool))
         self.resolve_names.toggled.connect(self.toggle_name_resolution)
@@ -345,23 +494,103 @@ class MainWindow(QMainWindow):
         self.check_button.setIcon(icon("arrows-rotate"))
         self.check_button.clicked.connect(self.start_monitor)
         heading.insertWidget(heading.indexOf(self.viewer_button), self.check_button)
+        heading.insertWidget(
+            heading.indexOf(self.viewer_button),
+            HelpButton(
+                "Run availability checks on saved devices now.",
+                self,
+                title="Check now",
+                detail="Probes a few known ports per device, then ping/ARP if enabled. "
+                "Does not repeat the full port scan.",
+            ),
+        )
 
         # Hosts the scan/monitoring option widgets; kept alive so the rest of the app can read them.
         self.settings_dialog = QDialog(self)
         self.settings_dialog.setWindowTitle("Settings")
         form = QFormLayout(self.settings_dialog)
-        form.addRow("Connect timeout", self.timeout)
-        form.addRow("VNC greeting timeout", self.greeting_timeout)
-        form.addRow(self.ping)
-        form.addRow(self.arp)
-        form.addRow(self.resolve_names)
-        form.addRow(self.peers_enabled)
-        form.addRow(self.monitor_enabled)
-        form.addRow("Check every", self.monitor_interval)
-        viewer_button = QPushButton("Viewer settings…")
-        viewer_button.setIcon(icon("gear"))
-        viewer_button.clicked.connect(self.viewer_settings)
-        form.addRow(viewer_button)
+        form.addRow(
+            form_label(
+                "Connect timeout",
+                "Seconds to wait for each TCP connect during a scan.",
+                self.settings_dialog,
+                detail="Independent from greeting timeout. Increase on slow or distant networks.",
+            ),
+            self.timeout,
+        )
+        form.addRow(
+            form_label(
+                "VNC greeting timeout",
+                "Seconds to read an RFB greeting on open VNC ports.",
+                self.settings_dialog,
+                detail="A short read can leave VNC as unverified even when the port is open.",
+            ),
+            self.greeting_timeout,
+        )
+        form.addRow(
+            checkbox_with_help(
+                self.ping,
+                "ICMP ping can discover hosts with no open scanned ports.",
+                self.settings_dialog,
+                detail="Uses the system ping utility. TCP discovery still works if ping is off.",
+            )
+        )
+        form.addRow(
+            checkbox_with_help(
+                self.arp,
+                "Windows: resolve local IPv4/MAC even when ping and TCP fail.",
+                self.settings_dialog,
+                detail="Active ARP on directly connected subnets only. Skips routed targets. "
+                "Not available on macOS/Linux.",
+            )
+        )
+        form.addRow(
+            checkbox_with_help(
+                self.resolve_names,
+                "Reverse DNS for discovered IPs (bounded concurrency).",
+                self.settings_dialog,
+                detail="Up to eight lookups at a time, ~2 s UI deadline each. Failures are cached briefly.",
+            )
+        )
+        form.addRow(
+            checkbox_with_help(
+                self.peers_enabled,
+                "Find other computers running Connectinator on this network.",
+                self.settings_dialog,
+                detail="Announce this computer over UDP 47823 and list other running copies on "
+                "the same subnet. No scan data, labels, or VNC credentials are shared.",
+            )
+        )
+        form.addRow(
+            checkbox_with_help(
+                self.monitor_enabled,
+                "Background reachability checks for saved devices.",
+                self.settings_dialog,
+                detail="Runs after startup and on a repeating interval. Full scans cancel an active check.",
+            )
+        )
+        form.addRow(
+            form_label(
+                "Check every",
+                "Seconds after the previous check finishes before the next one.",
+                self.settings_dialog,
+                detail="Default 60 s. Range 15 s to 1 hour. Use Check now for an immediate run.",
+            ),
+            self.monitor_interval,
+        )
+        remote_button = QPushButton("Remote client settings…")
+        remote_button.setIcon(icon("gear"))
+        remote_button.clicked.connect(self.remote_client_settings)
+        form.addRow(
+            form_label(
+                "Remote clients",
+                "Paths and options for VNC, SSH, RDP, Telnet, browser, and WinRM.",
+                self.settings_dialog,
+                detail="Connectinator only launches installed clients with argument lists; "
+                "passwords are never stored here.",
+            ),
+            remote_button,
+        )
         close_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close_buttons.rejected.connect(self.settings_dialog.accept)
         form.addRow(close_buttons)
@@ -370,16 +599,39 @@ class MainWindow(QMainWindow):
         self.search.setPlaceholderText("Filter by IP, hostname, label, MAC, service, or port…")
         self.search.textChanged.connect(self.filter_rows)
         filters.addWidget(self.search, 1)
+        filters.addWidget(
+            HelpButton(
+                "Filter the device list.",
+                self,
+                title="Filters",
+                detail="Search matches IP, hostname, label, MAC, services, and ports.\n"
+                "Status limits Online/Offline/Unchecked.\n"
+                "Remote services only hides devices with nothing to connect to.\n"
+                "Favorites only shows starred devices.",
+            )
+        )
         self.status_filter = ComboBox()
         self.status_filter.addItems(["All devices", "Online", "Offline", "Unchecked", "Connectinator peers"])
         self.status_filter.currentIndexChanged.connect(self.filter_rows)
         filters.addWidget(self.status_filter)
-        self.only_vnc = QCheckBox("VNC only")
-        self.only_vnc.toggled.connect(self.filter_rows)
-        filters.addWidget(self.only_vnc)
+        self.only_remote = QCheckBox("Remote services only")
+        self.only_remote.toggled.connect(self.filter_rows)
+        filters.addWidget(
+            checkbox_with_help(
+                self.only_remote,
+                "Show only devices with VNC, SSH, RDP, web, or other connectable services.",
+                self,
+            )
+        )
         self.only_favorites = QCheckBox("Favorites only")
         self.only_favorites.toggled.connect(self.filter_rows)
-        filters.addWidget(self.only_favorites)
+        filters.addWidget(
+            checkbox_with_help(
+                self.only_favorites,
+                "Show only devices saved as favorites.",
+                self,
+            )
+        )
         layout.addLayout(filters)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -399,10 +651,12 @@ class MainWindow(QMainWindow):
         self.table.sortByColumn(ADDRESS, Qt.SortOrder.AscendingOrder)
         self.table.selectionModel().selectionChanged.connect(self.show_device)
         self.table.doubleClicked.connect(self.double_click)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.table_context_menu)
         splitter.addWidget(self.table)
         self.details = QPlainTextEdit()
         self.details.setReadOnly(True)
-        self.details.setPlaceholderText("Select a device to inspect services. Double-click a VNC device to connect.")
+        self.details.setPlaceholderText("Select a device to inspect services. Double-click a row to connect.")
         splitter.addWidget(self.details)
         splitter.setSizes([360, 130])
         layout.addWidget(splitter, 1)
@@ -419,21 +673,47 @@ class MainWindow(QMainWindow):
         self.label_button.clicked.connect(self.edit_label)
         connection.addWidget(self.label_button)
         connection.addStretch()
-        connection.addWidget(QLabel("VNC endpoint"))
+        connection.addWidget(
+            form_label(
+                "Remote endpoint",
+                "Service and port to open with Connect.",
+                self,
+                detail="Lists connectable services found on the selected device. "
+                "Favorites restore the saved protocol:port when you reselect the device.",
+            )
+        )
         self.endpoint = ComboBox()
-        self.endpoint.setMinimumWidth(240)
+        self.endpoint.setMinimumWidth(280)
+        self.endpoint.currentIndexChanged.connect(self._endpoint_changed)
         connection.addWidget(self.endpoint)
         self.view_only = QCheckBox("View only")
-        self.view_only.setToolTip("Open the viewer without sending keyboard or mouse input")
         self.view_only.setChecked(self.settings.value("viewer/view_only", False, type=bool))
         self.view_only.toggled.connect(lambda checked: self.settings.setValue("viewer/view_only", checked))
-        connection.addWidget(self.view_only)
-        self.connect_button = QPushButton("Connect to VNC")
+        connection.addWidget(
+            checkbox_with_help(
+                self.view_only,
+                "VNC: open the viewer without sending keyboard or mouse input.",
+                self,
+                title="View only",
+            )
+        )
+        self.connect_button = QPushButton("Connect")
         self.connect_button.setIcon(icon("desktop", "#ffffff"))
         self.connect_button.setObjectName("primary")
         self.connect_button.setEnabled(False)
-        self.connect_button.clicked.connect(self.connect_vnc)
+        self.connect_button.clicked.connect(self.connect_remote)
         connection.addWidget(self.connect_button)
+        connection.addWidget(
+            HelpButton(
+                "Launch the selected remote client (Ctrl+Enter).",
+                self,
+                title="Connect",
+                detail="Opens VNC, SSH, RDP, Telnet, a browser for HTTP/S, or PowerShell for WinRM.\n"
+                "Double-click a table row or use the row context menu to connect quickly.",
+            )
+        )
+        QShortcut(QKeySequence("Ctrl+Return"), self, self.connect_remote)
+        QShortcut(QKeySequence("Ctrl+Enter"), self, self.connect_remote)
         layout.addLayout(connection)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
@@ -502,8 +782,10 @@ class MainWindow(QMainWindow):
         self.status.setText(f"{len(found)} online Tailscale peers added to Targets — press Scan network.")
 
     def load_saved(self):
-        self.model.apply([Device(address, [Service(p, "VNC") for p in ports])
-                          for address, ports in self.favorites.items() if address not in self.devices], observed=False)
+        self.model.apply([
+            Device(address, [favorite_service(*parsed) for ref in refs if (parsed := parse_favorite_ref(ref))])
+            for address, refs in self.favorites.items() if address not in self.devices
+        ], observed=False)
         self.proxy.invalidate()
         self.update_summary()
 
@@ -811,7 +1093,7 @@ class MainWindow(QMainWindow):
 
     def filter_rows(self):
         selected = self.selected()
-        self.proxy.set_filters(self.search.text(), self.only_vnc.isChecked(), self.only_favorites.isChecked(), self.status_filter.currentText())
+        self.proxy.set_filters(self.search.text(), self.only_remote.isChecked(), self.only_favorites.isChecked(), self.status_filter.currentText())
         if selected:
             self.select_address(selected.address)
         self.show_device()
@@ -838,7 +1120,7 @@ class MainWindow(QMainWindow):
         device = self.selected()
         self.favorite_button.setEnabled(device is not None)
         self.label_button.setEnabled(device is not None)
-        self.connect_button.setEnabled(bool(device and device.candidates))
+        self.connect_button.setEnabled(bool(device and device.connectable))
         if not device:
             self.details.clear()
             return
@@ -860,25 +1142,53 @@ class MainWindow(QMainWindow):
         lines.append("")
         for service in device.services:
             evidence = "protocol verified" if service.verified else "saved or inferred service; protocol currently unverified"
-            lines.append(f"TCP {service.port} · {service.name} · {evidence}")
+            kind = service_kind(service)
+            connect = f" · connectable as {kind}" if kind else ""
+            lines.append(f"TCP {service.port} · {service.name} · {evidence}{connect}")
             if service.banner:
                 lines.append(f"  Greeting: {service.banner}")
         if not device.services:
             lines.append("No open scanned ports." if device.complete else "Checking TCP ports…")
         self.details.setPlainText("\n".join(lines))
-        for service in device.candidates:
-            self.endpoint.addItem(f"{device.address}:{service.port}" + (" · verified" if service.verified else " · unverified"), service.port)
-        index = self.endpoint.findData(previous)
+        for service in device.connectable:
+            kind = service_kind(service) or service.name
+            label = (f"{kind} · {device.address}:{service.port}"
+                     + (" · verified" if service.verified else " · unverified"))
+            self.endpoint.addItem(label, f"{kind}:{service.port}")
+        preferred = previous if isinstance(previous, str) else None
+        if device.address in self.favorites and self.favorites[device.address]:
+            preferred = preferred or self.favorites[device.address][0]
+        index = self.endpoint.findData(preferred) if preferred else -1
         if index >= 0:
             self.endpoint.setCurrentIndex(index)
+        self._endpoint_changed()
 
     def double_click(self, index):
         if index.column() == 0:
             self.toggle_favorite()
         elif index.column() == NAME:
             self.edit_label()
-        elif self.selected() and self.selected().candidates:
-            self.connect_vnc()
+        elif self.selected() and self.selected().connectable:
+            self.connect_remote()
+
+    def table_context_menu(self, position):
+        index = self.table.indexAt(position)
+        if not index.isValid():
+            return
+        self.table.selectRow(index.row())
+        device = self.selected()
+        if not device:
+            return
+        menu = QMenu(self)
+        connect = menu.addAction("Connect")
+        connect.setEnabled(bool(device.connectable))
+        connect.triggered.connect(self.connect_remote)
+        label = menu.addAction("Edit label…")
+        label.triggered.connect(self.edit_label)
+        favorite = device.address in self.favorites
+        favorite_action = menu.addAction("Remove favorite" if favorite else "Save favorite")
+        favorite_action.triggered.connect(self.toggle_favorite)
+        menu.exec(self.table.viewport().mapToGlobal(position))
 
     def toggle_favorite(self):
         device = self.selected()
@@ -887,7 +1197,11 @@ class MainWindow(QMainWindow):
         if device.address in self.favorites:
             del self.favorites[device.address]
         else:
-            self.favorites[device.address] = [s.port for s in device.candidates]
+            self.favorites[device.address] = [
+                favorite_ref(kind, service.port)
+                for service in device.connectable
+                if (kind := service_kind(service))
+            ]
         self.settings.setValue("favorites", json.dumps(self.favorites))
         self.model.refresh(device.address)
         self.filter_rows()
@@ -913,39 +1227,82 @@ class MainWindow(QMainWindow):
         self.mark_dirty([address])
         self.filter_rows()
 
-    def viewer_settings(self):
-        dialog = ViewerDialog(self.settings, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.settings.setValue("viewer/path", dialog.path.text().strip())
-            self.settings.setValue("viewer/style", dialog.style.currentText())
-            return True
-        return False
+    def remote_client_settings(self) -> bool:
+        dialog = RemoteClientsDialog(self.settings, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        for kind, field in dialog.paths.items():
+            text = field.text().strip()
+            key = f"remote/{kind.lower()}_path"
+            if text:
+                self.settings.setValue(key, text)
+            else:
+                self.settings.remove(key)
+            if kind == "VNC":
+                self.settings.setValue("viewer/path", text)
+        self.settings.setValue("viewer/style", dialog.style.currentText())
+        self.settings.setValue("remote/ssh_user", dialog.ssh_user.text().strip())
+        browser = dialog.browser.text().strip()
+        if browser:
+            self.settings.setValue("remote/browser_path", browser)
+        else:
+            self.settings.remove("remote/browser_path")
+        return True
 
-    def connect_vnc(self):
+    def _endpoint_changed(self):
+        selection = self.endpoint.currentData() or ""
+        kind = selection.split(":", 1)[0] if selection else ""
+        self.view_only.setEnabled(kind == "VNC")
+
+    def connect_remote(self):
         device = self.selected()
-        port = self.endpoint.currentData()
-        if not device or port is None:
+        selection = self.endpoint.currentData()
+        if not device or not selection:
             return
-        executable = self.settings.value("viewer/path", "") or find_viewer()
-        if not executable or not Path(resolve_executable(executable)).is_file():
-            if not self.viewer_settings():
+        kind, port_text = selection.split(":", 1)
+        port = int(port_text)
+        executable = _client_path(self.settings, kind)
+        if kind == "VNC":
+            executable = resolve_executable(executable)  # Accept a macOS .app bundle.
+        if kind not in BROWSER_KINDS and (not executable or not Path(executable).is_file()):
+            if not self.remote_client_settings():
                 return
-            executable = self.settings.value("viewer/path", "")
+            executable = _client_path(self.settings, kind)
+            if kind == "VNC":
+                executable = resolve_executable(executable)
         try:
-            launch(executable, device.address, port, self.settings.value("viewer/style", "Double colon"),
-                   self.view_only.isChecked())
-            self.status.setText(f"Opened VNC viewer for {device.address}:{port}")
+            launch_client(
+                kind,
+                executable,
+                device.address,
+                port,
+                vnc_style=self.settings.value("viewer/style", "Double colon"),
+                view_only=self.view_only.isChecked(),
+                ssh_user=self.settings.value("remote/ssh_user", ""),
+                browser_executable=self.settings.value("remote/browser_path", ""),
+            )
+            self.status.setText(f"Opened {kind} client for {device.address}:{port}")
         except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "Could not launch viewer", str(exc))
+            QMessageBox.warning(self, "Could not launch client", str(exc))
 
     def export_results(self):
         self.flush_updates()
         filename, _ = QFileDialog.getSaveFileName(self, "Export scan results", "connectinator-results.json", "JSON (*.json)")
         if not filename:
             return
-        results = [dict(device.to_dict(), observed_this_scan=address in self.seen,
-                        favorite=address in self.favorites) for address, device in sorted(
-                            self.devices.items(), key=lambda item: ipaddress.IPv4Address(item[0]))]
+        results = [
+            dict(
+                device.to_dict(),
+                observed_this_scan=address in self.seen,
+                favorite=address in self.favorites,
+                connectable=[
+                    favorite_ref(service_kind(s), s.port)
+                    for s in device.connectable
+                    if (service_kind(s))
+                ],
+            )
+            for address, device in sorted(self.devices.items(), key=lambda item: ipaddress.IPv4Address(item[0]))
+        ]
         try:
             Path(filename).write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
             self.status.setText(f"Exported {len(results)} devices to {filename}")

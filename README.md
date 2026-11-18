@@ -1,9 +1,10 @@
 # Connectinator
 
 A PySide6 desktop app for discovering IPv4 devices, inspecting common TCP services,
-and quickly connecting to VNC servers with an installed viewer. Icons use QtAwesome.
-It runs on Windows, macOS, and Linux, and copies running on the same network find
-each other automatically (see **Other computers running Connectinator**).
+and connecting with installed remote clients (VNC, SSH, RDP, Telnet, HTTP/HTTPS, and
+WinRM on Windows). Icons use QtAwesome. It runs on Windows, macOS, and Linux, and
+copies on the same network find each other automatically (see **Other computers
+running Connectinator**).
 
 ## Setup and launch
 
@@ -66,7 +67,8 @@ the status filter to list only them. Their details show the computer name and OS
 The single-file build is **dist/Connectinator.exe**. Copy just that file to a
 Windows x64 machine and double-click it; Python, a virtual environment, and the
 source project are not needed. Qt, the theme, and QtAwesome fonts are included.
-VNC connections still open an installed VNC viewer selected in Viewer settings.
+Remote connections use clients you configure in **Remote client settings** (VNC viewers,
+OpenSSH, `mstsc`/`xfreerdp`, a browser for web ports, and so on).
 
 To rebuild on Windows, run **build.bat**, or use:
 
@@ -107,20 +109,26 @@ settings rather than beside the executable.
 3. Set separate **Connect** and **Greeting** timeouts, then click **Scan network**.
    VNC ports are checked first for each host. Results appear as services are found,
    without waiting for the host's remaining probes or ping. **Stop** preserves partial results.
-4. Select a device to inspect services. Verified VNC servers have a valid RFB greeting;
-   unverified VNC entries are guesses from the port number. Select an endpoint when a
-   machine has multiple VNC servers, then click **Connect to VNC** or double-click its row.
-5. Use **Viewer settings** to select an installed VNC viewer if it wasn't detected.
-   TigerVNC is a suitable option on every platform. On macOS you can pick the viewer's
-   `.app` (TigerVNC Viewer and RealVNC VNC Viewer in Applications are detected). The default `host::port` syntax passes the exact TCP
-   port; single-colon syntax is available for viewers that require it. Authentication
-   happens in the viewer. Connectinator does not install a viewer or embed a VNC client.
+4. Blue **?** icons in the window give short hover tips and longer help on click (including
+   table column headers). Select a device to inspect services. Verified VNC servers have a
+   valid RFB greeting; unverified VNC entries are guesses from the port number. Pick a
+   **Remote endpoint** (VNC, SSH, RDP, Telnet, HTTP/HTTPS, WinRM on Windows), then click
+   **Connect** or double-click the row.
+5. Use **Remote client settings** to choose installed clients when autodetection fails.
+   TigerVNC is a suitable VNC viewer on every platform; on macOS you can pick the viewer's
+   `.app` (TigerVNC Viewer and RealVNC VNC Viewer in Applications are detected). VNC defaults
+   to `host::port` syntax, which passes the exact TCP port; single-colon syntax is available
+   for viewers that require it. SSH uses your login name unless configured. RDP uses `mstsc`
+   on Windows or `xfreerdp`/`remmina` where available. HTTP and HTTPS open in your default
+   browser. Favorites remember both protocol and port (for example `SSH:22`). Authentication
+   happens in the client; Connectinator neither installs clients nor stores passwords.
 
 Save a selected device as a favorite for later connections. Favorites retain addresses
-and VNC ports, and appear after restart as unverified until scanned again. Filter by
-address, service, port, VNC, or favorites. **Export JSON** exports all listed devices
-(including rows hidden by filters), service evidence, and whether they responded in
-the latest scan. Viewer preferences, favorites, labels, and scan defaults use per-user Qt settings.
+and protocol/port refs (for example `SSH:22`), and appear after restart as unverified
+until scanned again. Filter by address, service, port, remote endpoints, or favorites.
+**Export JSON** exports all listed devices (including rows hidden by filters), service
+evidence, connectable endpoint refs, and whether they responded in the latest scan.
+Remote client preferences, favorites, labels, and scan defaults use per-user Qt settings.
 
 ## Names, labels, and local discovery
 
@@ -140,7 +148,8 @@ the latest scan. Viewer preferences, favorites, labels, and scan defaults use pe
   ARP errors are reported while TCP/ping continue. Active ARP is disabled on macOS/Linux.
 - The device list uses Qt's table model and filter proxy. Repeated snapshots are
   coalesced by IP and applied every 100 ms, with cached display/search data. Selection
-  and the chosen VNC endpoint are preserved as rows arrive or reorder.
+  and the chosen remote endpoint are preserved as rows arrive or reorder. Right-click a
+  row or press **Ctrl+Enter** to connect with the selected endpoint.
 
 ## Saved inventory and availability
 
@@ -159,9 +168,9 @@ Checks never overlap, and stopping/closing retains results already collected.
 
 The table shows **Online**, **Offline**, and **Last seen**, with a status filter.
 Offline means no response to the configured checks, which can also indicate a
-firewall or network isolation. The previous last-seen timestamp and known VNC ports
+firewall or network isolation. The previous last-seen timestamp and known services
 are preserved; you can still attempt a connection. Previously saved VNC services
-are shown as **Known** until a fresh full scan verifies the greeting again.
+remain **Known** until a fresh full scan verifies the greeting again.
 
 Availability checks try up to three known TCP ports, including a VNC endpoint,
 then fall back to ping and local Windows ARP when those discovery options are
@@ -194,7 +203,9 @@ guarantee that a particular VNC service is accepting connections or credentials.
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-On Linux/macOS: `.venv/bin/python -m unittest discover -s tests -v`.
+On Linux/macOS: `.venv/bin/python -m unittest discover -s tests -v`. Alternatively,
+`./run.sh compat` (or `python scripts/linux_compat_runner.py`) runs those unit tests and an
+offscreen loopback self-test; it writes `build/linux-compat-self-test.json`.
 
 Tests use loopback fake servers, mocked native ARP and DNS, mocked viewer launches,
 and an offscreen Qt interface; they do not scan the LAN. Project conventions and a

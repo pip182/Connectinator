@@ -3,10 +3,50 @@
 from pathlib import Path
 import tempfile
 
-from PySide6.QtCore import QTemporaryDir
-from PySide6.QtWidgets import QComboBox, QStyledItemDelegate
+from PySide6.QtCore import QTemporaryDir, Qt
+from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QMessageBox, QStyledItemDelegate, QToolButton, QWidget
 
 from .icons import icon
+
+
+class HelpButton(QToolButton):
+    """Small ? icon: hover shows a tooltip; click opens fuller help."""
+
+    def __init__(self, tooltip: str, parent=None, *, title: str = "", detail: str = ""):
+        super().__init__(parent)
+        self._title = title or "Help"
+        self._detail = detail or tooltip
+        self.setObjectName("help")
+        self.setIcon(icon("circle-question", "#8ea2ff"))
+        self.setToolTip(tooltip)
+        self.setAutoRaise(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.clicked.connect(self._show_detail)
+
+    def _show_detail(self):
+        QMessageBox.information(self.window(), self._title, self._detail)
+
+
+def form_label(text: str, tooltip: str, parent=None, *, title: str = "", detail: str = "") -> QWidget:
+    row = QWidget(parent)
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(6)
+    layout.addWidget(QLabel(text))
+    layout.addWidget(HelpButton(tooltip, row, title=title or text, detail=detail or tooltip))
+    return row
+
+
+def checkbox_with_help(checkbox: QCheckBox, tooltip: str, parent=None, *, title: str = "", detail: str = "") -> QWidget:
+    row = QWidget(parent)
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(6)
+    layout.addWidget(checkbox)
+    layout.addWidget(HelpButton(tooltip, row, title=title or checkbox.text(), detail=detail or tooltip))
+    layout.addStretch()
+    return row
 
 
 class ComboBox(QComboBox):
@@ -86,6 +126,8 @@ QSplitter::handle:hover { background: #3a8a99; }
 QProgressBar { background: #25252b; border: none; border-radius: 3px; }
 QProgressBar::chunk { background: #5ccfe6; border-radius: 3px; }
 QToolTip { background: #232329; color: #e8e8e8; border: 1px solid #55555f; padding: 5px; }
+QToolButton#help { background: transparent; border: none; padding: 2px; }
+QToolButton#help:hover { background: #2f2f38; border-radius: 9px; }
 """
 
 

@@ -1,1 +1,1 @@
-"""Connectinator: local network discovery and VNC launcher."""
+"""Connectinator: IPv4 discovery and remote client launcher."""

@@ -51,19 +51,22 @@ class AppTests(unittest.TestCase):
     def test_filter_favorite_and_connect_preserve_selected_port(self):
         device = Device("10.0.0.2", [Service(5907, "VNC", True, "RFB 003.008")])
         self.window.add_device(device)
-        self.window.add_device(Device("10.0.0.10", [Service(22, "SSH", True)]))
+        self.window.add_device(Device("10.0.0.10", [Service(3306, "MySQL")]))
         self.select("10.0.0.2")
         self.assertTrue(self.window.connect_button.isEnabled())
         self.window.toggle_favorite()
-        self.assertEqual(self.window.favorites[device.address], [5907])
-        self.window.only_vnc.setChecked(True)
+        self.assertEqual(self.window.favorites[device.address], ["VNC:5907"])
+        self.window.only_remote.setChecked(True)
         self.assertEqual(self.window.proxy.rowCount(), 1)
         executable = Path(self.directory.name) / "fake viewer.exe"
         executable.touch()
         self.settings.setValue("viewer/path", str(executable))
-        with patch("connectinator.app.launch") as launch:
-            self.window.connect_vnc()
-            launch.assert_called_once_with(str(executable), device.address, 5907, "Double colon", False)
+        with patch("connectinator.app.launch_client") as launch:
+            self.window.connect_remote()
+            launch.assert_called_once_with(
+                "VNC", str(executable), device.address, 5907,
+                vnc_style="Double colon", view_only=False, ssh_user="", browser_executable="",
+            )
         self.window.search.setText("no-match")
         self.assertFalse(self.window.connect_button.isEnabled())
 
@@ -114,6 +117,8 @@ class AppTests(unittest.TestCase):
         self.window.hostname_found("10.0.0.2", "shop-pc.example")
         self.window.add_device(Device("10.0.0.2", [Service(5900, "VNC", True), Service(22, "SSH", True)]))
         self.window.flush_updates()
+        self.assertIn("VNC:5900", self.window.model.cells["10.0.0.2"][7])
+        self.assertIn("SSH:22", self.window.model.cells["10.0.0.2"][7])
         self.assertEqual(self.window.selected().address, "10.0.0.2")
         self.assertEqual(self.window.selected().label, "Shop workstation")
         self.assertEqual(self.window.selected().hostname, "shop-pc.example")
@@ -146,11 +151,11 @@ class AppTests(unittest.TestCase):
         self.window.add_device(Device("10.0.0.2", [Service(22, "SSH")]))
         self.select("10.0.0.10")
         self.assertEqual(self.window.proxy.index(0, 1).data(), "10.0.0.2")
-        self.window.endpoint.setCurrentIndex(self.window.endpoint.findData(5907))
+        self.window.endpoint.setCurrentIndex(self.window.endpoint.findData("VNC:5907"))
         self.window.add_device(Device("10.0.0.1", [Service(80, "HTTP")]))
         self.window.flush_updates()
         self.assertEqual(self.window.selected().address, "10.0.0.10")
-        self.assertEqual(self.window.endpoint.currentData(), 5907)
+        self.assertEqual(self.window.endpoint.currentData(), "VNC:5907")
 
     def test_offline_keeps_services_and_last_seen_and_status_filter(self):
         self.window.add_device(Device("10.0.0.2", [Service(5907, "VNC", True)]))

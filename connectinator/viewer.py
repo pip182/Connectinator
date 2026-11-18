@@ -52,7 +52,7 @@ def viewer_command(executable: str, address: str, port: int, style: str = "Doubl
                    view_only: bool = False) -> list[str]:
     executable = resolve_executable(executable)
     if not Path(executable).is_file():
-        raise ValueError("Choose an installed VNC viewer executable in Viewer settings.")
+        raise ValueError("Choose an installed VNC viewer executable in Remote client settings.")
     separator = ":" if style == "Single colon" else "::"
     target = f"{address}{separator}{port}"
     if not view_only:

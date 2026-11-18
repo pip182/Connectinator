@@ -27,10 +27,10 @@ VNC_PORTS = tuple(range(5900, 5910))
 COMMON_PORTS = tuple(sorted(set(SERVICES) | set(VNC_PORTS)))
 MAX_HOSTS = 4096
 MAX_PORTS = 128
-# These protocols normally wait for a client request. Keep their passive sniff short
-# in the common-services profile; custom scans use the full greeting budget.
 # Hide console windows for helper processes on Windows; zero elsewhere.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# These protocols normally wait for a client request. Keep their passive sniff short
+# in the common-services profile; custom scans use the full greeting budget.
 CLIENT_FIRST_PORTS = {53, 80, 135, 139, 443, 445, 515, 631, 1433, 1883,
                       3389, 5432, 5985, 5986, 8000, 8080, 8443, 9100}
 
@@ -63,6 +63,12 @@ class Device:
     @property
     def candidates(self) -> list[Service]:
         return [s for s in self.services if s.name == "VNC"]
+
+    @property
+    def connectable(self) -> list[Service]:
+        from .remote import service_kind
+
+        return [s for s in self.services if service_kind(s)]
 
     def to_dict(self) -> dict:
         return asdict(self)

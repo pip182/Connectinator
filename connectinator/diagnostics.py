@@ -122,12 +122,18 @@ def self_test(report_filename: str):
                 if not getattr(sys, "frozen", False):
                     command.extend(["-m", "connectinator"])
                 command.extend(["--arp-worker", str(request), str(result)])
-                completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                           stderr=subprocess.DEVNULL, timeout=15,
-                                           creationflags=NO_WINDOW)
+                completed = subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                    creationflags=NO_WINDOW,
+                )
                 rows = [json.loads(line) for line in result.read_text(encoding="utf-8").splitlines()]
-                report["checks"]["arp_helper"] = bool(completed.returncode == 0 and len(rows) == 1
-                                                      and rows[0]["address"] == "127.0.0.1")
+                report["checks"]["arp_helper"] = bool(
+                    completed.returncode == 0 and len(rows) == 1 and rows[0]["address"] == "127.0.0.1"
+                )
             report["checks"]["peer_discovery"] = _loopback_peers(app)
             # Release the SQLite connection before TemporaryDirectory removes it.
             window.close()

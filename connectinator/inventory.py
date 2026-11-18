@@ -7,12 +7,24 @@ import ipaddress
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
 from PySide6.QtGui import QColor
 
+from .remote import service_kind
 from .scanner import Device
 from .icons import icon
 from .storage import utc_now
 
-STAR, ADDRESS, NAME, STATUS, MAC, DISCOVERY, VNC, SERVICES, LAST_SEEN = range(9)
-HEADERS = ("", "IP address", "Name / label", "Status", "MAC address", "Discovery", "VNC", "Known TCP services", "Last seen")
+STAR, ADDRESS, NAME, STATUS, MAC, DISCOVERY, REMOTE, SERVICES, LAST_SEEN = range(9)
+HEADERS = ("", "IP address", "Name / label", "Status", "MAC address", "Discovery", "Remote endpoints", "Known TCP services", "Last seen")
+COLUMN_TIPS = {
+    STAR: "Favorites. Click the star column or use Save favorite.",
+    ADDRESS: "IPv4 address for the device.",
+    NAME: "Your label or reverse-DNS hostname. Double-click to edit the label.",
+    STATUS: "Online, Offline, or Unchecked (not checked since this session started).",
+    MAC: "MAC from Windows ARP when available.",
+    DISCOVERY: "How the device was found in the latest scan, or saved inventory.",
+    REMOTE: "Services you can connect to (VNC, SSH, RDP, HTTP/S, etc.). ✓ means protocol verified.",
+    SERVICES: "All known open TCP ports from scan or saved inventory.",
+    LAST_SEEN: "When the device last responded to a scan or availability check.",
+}
 
 
 def display_time(value):
@@ -49,9 +61,12 @@ class DeviceModel(QAbstractTableModel):
             if role == Qt.ItemDataRole.DecorationRole:
                 return icon("star", "#e8b04a")
             if role == Qt.ItemDataRole.ToolTipRole:
-                return "Favorites"
-        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
-            return HEADERS[section]
+                return COLUMN_TIPS[STAR]
+        if orientation == Qt.Orientation.Horizontal:
+            if role == Qt.ItemDataRole.DisplayRole:
+                return HEADERS[section]
+            if role == Qt.ItemDataRole.ToolTipRole:
+                return COLUMN_TIPS.get(section, "")
         return None
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
@@ -72,12 +87,14 @@ class DeviceModel(QAbstractTableModel):
                 return icon("star", "#e8b04a")
             if index.column() == NAME and (device.label or device.hostname):
                 return icon("tag" if device.label else "desktop")
-            if index.column() == VNC:
-                if device.vnc:
-                    return icon("circle-check", "#6fd36f")
-                if device.candidates:
+            if index.column() == REMOTE:
+                if device.connectable:
+                    if any(service.verified for service in device.connectable):
+                        return icon("circle-check", "#6fd36f")
                     return icon("circle-question", "#e8b04a")
-        if role == Qt.ItemDataRole.ForegroundRole and index.column() == VNC and device.vnc:
+        if role == Qt.ItemDataRole.ForegroundRole and index.column() == REMOTE and any(
+            service.verified for service in device.connectable
+        ):
             return QColor("#6fd36f")
         if role == Qt.ItemDataRole.ForegroundRole and index.column() == STATUS:
             return QColor("#6fd36f" if device.online is True else "#f07178" if device.online is False else "#9a9aa3")
@@ -106,10 +123,9 @@ class DeviceModel(QAbstractTableModel):
 
     def _cache_row(self, device: Device):
         address = device.address
-        verified = ", ".join(str(s.port) for s in device.vnc)
-        candidates = ", ".join(str(s.port) for s in device.candidates if not s.verified)
-        prefix = "Known" if device.last_seen else "Unverified"
-        vnc = f"Verified · {verified}" if verified else f"{prefix} · {candidates}" if candidates else "—"
+        remote = ", ".join(
+            f"{service_kind(s) or s.name}:{s.port}{' ✓' if s.verified else ''}" for s in device.connectable
+        ) or "—"
         evidence = [name for present, name in ((device.services, "TCP"), (device.ping, "ping"), (device.mac, "ARP")) if present]
         peer = self.peers.get(address)
         if address in self.seen:
@@ -123,7 +139,7 @@ class DeviceModel(QAbstractTableModel):
             "", address,
             device.label or device.hostname or (peer.name if peer else "") or "—",
             "Online" if device.online is True else "Offline" if device.online is False else "Unchecked",
-            device.mac or "—", discovery, vnc,
+            device.mac or "—", discovery, remote,
             services or ("Checking ports…" if not device.complete and self.scanning else "No known open ports"),
             display_time(device.last_seen),
         )
@@ -178,13 +194,13 @@ class DeviceModel(QAbstractTableModel):
 class DeviceFilter(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.query, self.only_vnc, self.only_favorites = "", False, False
+        self.query, self.only_remote, self.only_favorites = "", False, False
         self.status_filter = "All devices"
         self.setDynamicSortFilter(False)
 
-    def set_filters(self, query: str, only_vnc: bool, only_favorites: bool, status_filter="All devices"):
+    def set_filters(self, query: str, only_remote: bool, only_favorites: bool, status_filter="All devices"):
         self.query = query.strip().casefold()
-        self.only_vnc, self.only_favorites = only_vnc, only_favorites
+        self.only_remote, self.only_favorites = only_remote, only_favorites
         self.status_filter = status_filter
         self.invalidate()
 
@@ -193,7 +209,7 @@ class DeviceFilter(QSortFilterProxyModel):
         address = model.addresses[row]
         online = model.devices[address].online
         return (self.query in model.search_text[address]
-                and (not self.only_vnc or bool(model.devices[address].candidates))
+                and (not self.only_remote or bool(model.devices[address].connectable))
                 and (not self.only_favorites or address in model.favorites)
                 and (self.status_filter == "All devices" or
                      self.status_filter == "Online" and online is True or
