@@ -19,6 +19,8 @@ import tempfile
 import time
 from typing import Callable
 
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def arp_targets_for(addresses: list[str], interfaces: list[tuple[str, int]]) -> dict[str, str]:
     """Map only on-link unicast targets to a source interface (longest prefix wins)."""
@@ -91,7 +93,7 @@ async def _discover_frozen(targets, on_device, on_warning):
             process = await asyncio.create_subprocess_exec(
                 sys.executable, "--arp-worker", str(request), str(result),
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=NO_WINDOW,
             )
             last_activity = time.monotonic()
             partial = ""
@@ -142,7 +144,7 @@ async def discover_arp(targets: dict[str, str], on_device: Callable[[str, str], 
         process = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "connectinator.discovery", "--arp-worker",
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=NO_WINDOW,
         )
         process.stdin.write((json.dumps(targets) + "\n").encode("utf-8"))
         await process.stdin.drain()

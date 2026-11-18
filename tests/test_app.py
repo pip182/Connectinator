@@ -27,6 +27,7 @@ class AppTests(unittest.TestCase):
         self.settings = QSettings(str(Path(self.directory.name) / "settings.ini"), QSettings.Format.IniFormat)
         self.settings.setValue("scan/resolve_names", False)
         self.settings.setValue("monitor/enabled", False)
+        self.settings.setValue("peers/enabled", False)  # Tests never broadcast on the LAN.
         self.window = MainWindow(self.settings)
 
     def tearDown(self):
@@ -261,6 +262,43 @@ class AppTests(unittest.TestCase):
         self.assertEqual(order, ["monitor started", "monitor stopped", "scan started"])
         self.assertEqual(self.window.devices["10.0.0.2"].hostname, "saved-pc")
         self.assertIn("127.0.0.1", self.window.devices)
+
+    def test_connectinator_peer_is_listed_kept_online_and_released(self):
+        from connectinator.inventory import DISCOVERY, NAME
+        from connectinator.peers import Peer
+        self.window.add_device(Device("10.0.0.20", [Service(22, "SSH", True)]))
+        self.window.peer_seen(Peer("10.0.0.21", "a" * 32, "Shop iMac", "macOS 15"))
+        self.window.peer_seen(Peer("10.0.0.20", "b" * 32, "Bench PC", "Windows 11"))
+        self.window.flush_updates()
+        model = self.window.model
+        self.assertIs(self.window.devices["10.0.0.21"].online, True)
+        self.assertEqual(model.cells["10.0.0.21"][NAME], "Shop iMac")
+        self.assertEqual(model.cells["10.0.0.21"][DISCOVERY], "Connectinator peer")
+        self.assertEqual(model.cells["10.0.0.20"][DISCOVERY], "TCP + Connectinator")
+        self.window.status_filter.setCurrentText("Connectinator peers")
+        self.assertEqual(self.window.proxy.rowCount(), 2)
+        self.window.search.setText("imac")
+        self.assertEqual(self.window.proxy.rowCount(), 1)
+        self.select("10.0.0.21")
+        self.assertIn("Connectinator running: Shop iMac · macOS 15", self.window.details.toPlainText())
+        # Blocked TCP/ping checks don't mark a live peer offline.
+        self.window.availability_found(Availability("10.0.0.21", False, "2026-01-01T00:00:00+00:00"))
+        self.window.flush_updates()
+        self.assertIs(self.window.devices["10.0.0.21"].online, True)
+        self.window.peer_lost("10.0.0.21")
+        self.window.flush_updates()
+        self.assertNotIn("10.0.0.21", model.peers)
+        self.assertEqual(model.cells["10.0.0.21"][DISCOVERY], "Saved inventory")
+        self.assertIn("10.0.0.21", self.window.devices)  # Kept as an ordinary saved device.
+
+    def test_peer_discovery_setting_starts_and_stops_listener(self):
+        self.window.peer_discovery.port = 0  # Ephemeral port; nothing leaves loopback.
+        self.window.peer_discovery.targets = []
+        self.window.peers_enabled.setChecked(True)
+        self.assertTrue(self.window.peer_discovery.running)
+        self.window.peers_enabled.setChecked(False)
+        self.assertFalse(self.window.peer_discovery.running)
+        self.assertFalse(self.settings.value("peers/enabled", type=bool))
 
     def test_window_close_cancels_an_active_scan(self):
         started = threading.Event()

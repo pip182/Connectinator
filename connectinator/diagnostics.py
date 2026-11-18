@@ -10,6 +10,35 @@ import threading
 import time
 import traceback
 
+from .scanner import NO_WINDOW
+
+
+def _loopback_peers(app) -> bool:
+    """Two discovery endpoints exchange beacons on loopback only (no LAN broadcast)."""
+    import socket
+    from .peers import PeerDiscovery
+
+    ports = []
+    for _ in range(2):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            ports.append(probe.getsockname()[1])
+    first = PeerDiscovery(port=ports[0], targets=[("127.0.0.1", ports[1])], name="self-test-a")
+    second = PeerDiscovery(port=ports[1], targets=[("127.0.0.1", ports[0])], name="self-test-b")
+    found = []
+    first.peer_seen.connect(found.append)
+    try:
+        if not (first.start() and second.start()):
+            return False
+        deadline = time.monotonic() + 3
+        while not found and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+        return bool(found and found[0].name == "self-test-b")
+    finally:
+        first.stop()
+        second.stop()
+
 
 def self_test(report_filename: str):
     from PySide6.QtCore import QEvent, QSettings, Qt
@@ -33,6 +62,7 @@ def self_test(report_filename: str):
             settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.Format.IniFormat)
             settings.setValue("scan/resolve_names", False)
             settings.setValue("monitor/enabled", False)
+            settings.setValue("peers/enabled", False)
             window = MainWindow(settings)
             window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
             window.show()
@@ -84,19 +114,21 @@ def self_test(report_filename: str):
                     server.shutdown()
                     server_thread.join(timeout=2)
 
-            request = Path(directory) / "arp-request.json"
-            result = Path(directory) / "arp-result.jsonl"
-            request.write_text(json.dumps({"127.0.0.1": "127.0.0.1"}), encoding="utf-8")
-            command = [sys.executable]
-            if not getattr(sys, "frozen", False):
-                command.extend(["-m", "connectinator"])
-            command.extend(["--arp-worker", str(request), str(result)])
-            completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL, timeout=15,
-                                       creationflags=subprocess.CREATE_NO_WINDOW)
-            rows = [json.loads(line) for line in result.read_text(encoding="utf-8").splitlines()]
-            report["checks"]["arp_helper"] = bool(completed.returncode == 0 and len(rows) == 1
-                                                  and rows[0]["address"] == "127.0.0.1")
+            if sys.platform == "win32":  # SendARP helper is Windows-only.
+                request = Path(directory) / "arp-request.json"
+                result = Path(directory) / "arp-result.jsonl"
+                request.write_text(json.dumps({"127.0.0.1": "127.0.0.1"}), encoding="utf-8")
+                command = [sys.executable]
+                if not getattr(sys, "frozen", False):
+                    command.extend(["-m", "connectinator"])
+                command.extend(["--arp-worker", str(request), str(result)])
+                completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL, timeout=15,
+                                           creationflags=NO_WINDOW)
+                rows = [json.loads(line) for line in result.read_text(encoding="utf-8").splitlines()]
+                report["checks"]["arp_helper"] = bool(completed.returncode == 0 and len(rows) == 1
+                                                      and rows[0]["address"] == "127.0.0.1")
+            report["checks"]["peer_discovery"] = _loopback_peers(app)
             # Release the SQLite connection before TemporaryDirectory removes it.
             window.close()
             app.processEvents()

@@ -27,6 +27,7 @@ class DeviceModel(QAbstractTableModel):
         super().__init__(parent)
         self.favorites, self.labels = favorites, labels
         self.devices: dict[str, Device] = {}
+        self.peers: dict = {}  # address -> peers.Peer; running Connectinator instances, this session only
         self.seen: set[str] = set()
         self.addresses: list[str] = []
         self.rows: dict[str, int] = {}
@@ -63,6 +64,8 @@ class DeviceModel(QAbstractTableModel):
             return address
         device = self.devices[address]
         if role == Qt.ItemDataRole.DecorationRole:
+            if index.column() == DISCOVERY and address in self.peers:
+                return icon("network-wired", "#58dfb3")
             if index.column() == STATUS:
                 return icon("circle", "#6fd36f" if device.online is True else "#f07178" if device.online is False else "#8a8a93")
             if index.column() == STAR and address in self.favorites:
@@ -79,7 +82,9 @@ class DeviceModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.ForegroundRole and index.column() == STATUS:
             return QColor("#6fd36f" if device.online is True else "#f07178" if device.online is False else "#9a9aa3")
         if role == Qt.ItemDataRole.ToolTipRole:
+            peer = self.peers.get(address)
             return "\n".join(v for v in (address, device.label, device.hostname, device.mac,
+                                         peer and f"Connectinator running: {peer.name} · {peer.platform}",
                                          f"Last seen: {device.last_seen or 'never'}",
                                          f"Last checked: {device.last_checked or 'never'}",
                                          "Offline means no response to the configured checks; a firewall may block them.") if v)
@@ -88,6 +93,7 @@ class DeviceModel(QAbstractTableModel):
     def clear(self):
         self.beginResetModel()
         self.devices.clear()
+        self.peers.clear()
         self.seen.clear()
         self.addresses.clear()
         self.rows.clear()
@@ -105,13 +111,17 @@ class DeviceModel(QAbstractTableModel):
         prefix = "Known" if device.last_seen else "Unverified"
         vnc = f"Verified · {verified}" if verified else f"{prefix} · {candidates}" if candidates else "—"
         evidence = [name for present, name in ((device.services, "TCP"), (device.ping, "ping"), (device.mac, "ARP")) if present]
-        discovery = " + ".join(evidence) if address in self.seen else "Saved inventory"
+        peer = self.peers.get(address)
+        if address in self.seen:
+            discovery = " + ".join(evidence + ["Connectinator"] * bool(peer))
+        else:
+            discovery = "Connectinator peer" if peer else "Saved inventory"
         if address in self.seen and not device.complete:
             discovery += " · scanning" if self.scanning else " · partial"
         services = ", ".join(f"{s.name}:{s.port}{' ✓' if s.verified else ''}" for s in device.services)
         self.cells[address] = (
             "", address,
-            device.label or device.hostname or "—",
+            device.label or device.hostname or (peer.name if peer else "") or "—",
             "Online" if device.online is True else "Offline" if device.online is False else "Unchecked",
             device.mac or "—", discovery, vnc,
             services or ("Checking ports…" if not device.complete and self.scanning else "No known open ports"),
@@ -188,7 +198,8 @@ class DeviceFilter(QSortFilterProxyModel):
                 and (self.status_filter == "All devices" or
                      self.status_filter == "Online" and online is True or
                      self.status_filter == "Offline" and online is False or
-                     self.status_filter == "Unchecked" and online is None))
+                     self.status_filter == "Unchecked" and online is None or
+                     self.status_filter == "Connectinator peers" and address in model.peers))
 
     def lessThan(self, left, right):
         model = self.sourceModel()

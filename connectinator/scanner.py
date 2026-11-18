@@ -29,6 +29,8 @@ MAX_HOSTS = 4096
 MAX_PORTS = 128
 # These protocols normally wait for a client request. Keep their passive sniff short
 # in the common-services profile; custom scans use the full greeting budget.
+# Hide console windows for helper processes on Windows; zero elsewhere.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 CLIENT_FIRST_PORTS = {53, 80, 135, 139, 443, 445, 515, 631, 1433, 1883,
                       3389, 5432, 5985, 5986, 8000, 8080, 8443, 9100}
 
@@ -164,7 +166,7 @@ async def ping_host(address: str, timeout: float) -> bool:
     try:
         process = await asyncio.create_subprocess_exec(
             executable, *args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+            creationflags=NO_WINDOW,
         )
         output, _ = await asyncio.wait_for(process.communicate(), timeout + 0.5)
         # Windows can return zero for an ICMP "destination unreachable" response.

@@ -24,14 +24,15 @@ from PySide6.QtWidgets import (
 )
 
 from .scanner import COMMON_PORTS, VNC_PORTS, Device, Service, parse_ports, parse_targets, scan
-from .viewer import find_viewer, launch
+from .viewer import find_viewer, launch, resolve_executable
 from .discovery import arp_targets_for
 from .inventory import ADDRESS, NAME, SERVICES, DeviceModel, DeviceFilter, display_time
 from .names import HostnameResolver
 from .icons import icon
 from .theme import ComboBox, apply_theme
-from .storage import InventoryStore
+from .storage import InventoryStore, utc_now
 from .monitor import Availability, check_devices
+from .peers import PeerDiscovery
 
 
 def local_networks() -> list[tuple[str, str]]:
@@ -157,7 +158,7 @@ class ViewerDialog(QDialog):
             self.path.setText(path)
 
     def accept(self):
-        if not Path(self.path.text().strip()).is_file():
+        if not Path(resolve_executable(self.path.text().strip())).is_file():
             QMessageBox.warning(self, "Viewer not found", "Choose an existing VNC viewer executable.")
             return
         super().accept()
@@ -175,6 +176,7 @@ class MainWindow(QMainWindow):
         self.pending_names: dict[str, str] = {}
         self.pending_progress = None
         self.pending_availability: dict[str, Availability] = {}
+        self.pending_peers: dict[str, object] = {}  # address -> Peer, or None when it left
         self.dirty: set[str] = set()
         self.store = None
         self.scan_warnings: list[str] = []
@@ -203,8 +205,14 @@ class MainWindow(QMainWindow):
         self.resize(1180, 800)
         self.setMinimumSize(900, 640)
         self.build_ui()
+        self.peer_discovery = PeerDiscovery(self)
+        self.peer_discovery.peer_seen.connect(self.peer_seen)
+        self.peer_discovery.peer_lost.connect(self.peer_lost)
+        self.peer_discovery.failed.connect(self.status.setText)
         self.load_inventory()
         self.load_saved()
+        if self.peers_enabled.isChecked():
+            self.peer_discovery.start()
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setInterval(100)
         self.refresh_timer.timeout.connect(self.flush_updates)
@@ -312,6 +320,11 @@ class MainWindow(QMainWindow):
         self.resolve_names = QCheckBox("Resolve hostnames")
         self.resolve_names.setChecked(self.settings.value("scan/resolve_names", True, type=bool))
         self.resolve_names.toggled.connect(self.toggle_name_resolution)
+        self.peers_enabled = QCheckBox("Find other computers running Connectinator")
+        self.peers_enabled.setToolTip("Announce this computer and list other running Connectinator apps "
+                                      "on the local network (UDP broadcast, port 47823).")
+        self.peers_enabled.setChecked(self.settings.value("peers/enabled", True, type=bool))
+        self.peers_enabled.toggled.connect(self.toggle_peers)
         layout.addWidget(scan_panel)
         if not self.targets.text() and self.network.count() > 1:
             self.network.setCurrentIndex(1)
@@ -342,6 +355,7 @@ class MainWindow(QMainWindow):
         form.addRow(self.ping)
         form.addRow(self.arp)
         form.addRow(self.resolve_names)
+        form.addRow(self.peers_enabled)
         form.addRow(self.monitor_enabled)
         form.addRow("Check every", self.monitor_interval)
         viewer_button = QPushButton("Viewer settings…")
@@ -357,7 +371,7 @@ class MainWindow(QMainWindow):
         self.search.textChanged.connect(self.filter_rows)
         filters.addWidget(self.search, 1)
         self.status_filter = ComboBox()
-        self.status_filter.addItems(["All devices", "Online", "Offline", "Unchecked"])
+        self.status_filter.addItems(["All devices", "Online", "Offline", "Unchecked", "Connectinator peers"])
         self.status_filter.currentIndexChanged.connect(self.filter_rows)
         filters.addWidget(self.status_filter)
         self.only_vnc = QCheckBox("VNC only")
@@ -689,6 +703,21 @@ class MainWindow(QMainWindow):
         # Coalesce repeated snapshots for the same IP until the next 100 ms refresh.
         self.pending_devices[device.address] = device
 
+    @Slot(object)
+    def peer_seen(self, peer):
+        self.pending_peers[peer.address] = peer
+
+    @Slot(str)
+    def peer_lost(self, address):
+        self.pending_peers[address] = None
+
+    def toggle_peers(self, enabled):
+        self.settings.setValue("peers/enabled", enabled)
+        if enabled:
+            self.peer_discovery.start()
+        else:
+            self.peer_discovery.stop()
+
     @Slot(str, str)
     def hostname_found(self, address, name):
         self.pending_names[address] = name
@@ -702,14 +731,26 @@ class MainWindow(QMainWindow):
             if self.worker and not self.worker.cancel.is_set() and not self.worker.error:
                 suffix = " · finishing discovery" if completed == total else ""
                 self.status.setText(f"Scanning · {completed} / {total} hosts checked{suffix}")
-        if not self.pending_devices and not self.pending_names and not self.pending_availability:
+        if not (self.pending_devices or self.pending_names or self.pending_availability or self.pending_peers):
             return
         selected = self.selected()
         address = selected.address if selected else None
         updates, self.pending_devices = self.pending_devices, {}
         names, self.pending_names = self.pending_names, {}
         availability, self.pending_availability = self.pending_availability, {}
+        peers, self.pending_peers = self.pending_peers, {}
         self.model.apply(list(updates.values()))
+        peer_devices = []
+        for target, peer in peers.items():
+            if peer is None:
+                if self.model.peers.pop(target, None) is not None:
+                    self.model.refresh(target)
+                continue
+            self.model.peers[target] = peer
+            device = self.devices.get(target) or Device(target)
+            now = utc_now()
+            peer_devices.append(replace(device, online=True, last_seen=now, last_checked=now))
+        self.model.apply(peer_devices, observed=False)
         statuses = []
         for target, result in availability.items():
             device = self.devices.get(target)
@@ -722,6 +763,8 @@ class MainWindow(QMainWindow):
                                 for s in device.services]
                     if result.verified_vnc:
                         self.model.seen.add(target)  # counts as verified this session
+                elif target in self.model.peers:
+                    continue  # Its beacon is fresher evidence than blocked TCP/ping checks.
                 else:
                     services = [replace(s, verified=False) for s in device.services]
                 statuses.append(replace(device, online=result.online, last_checked=result.checked_at,
@@ -747,7 +790,7 @@ class MainWindow(QMainWindow):
         scrollbar.setValue(scroll)
         self.update_summary()
         self.show_device()
-        self.mark_dirty(set(updates) | set(names) | set(availability))
+        self.mark_dirty(set(updates) | set(names) | set(availability) | {d.address for d in peer_devices})
         if self.resolve_names.isChecked() and not self.closing and not (self.worker and self.worker.cancel.is_set()):
             for target in updates:
                 self.resolver.lookup(target)
@@ -763,7 +806,8 @@ class MainWindow(QMainWindow):
 
     def update_summary(self):
         self.summary.setText(f"{len(self.devices)} saved  ·  {self.model.online_count} online  ·  "
-                             f"{self.model.offline_count} offline  ·  {self.model.confirmed} verified VNC")
+                             f"{self.model.offline_count} offline  ·  {self.model.confirmed} verified VNC"
+                             + (f"  ·  {len(self.model.peers)} Connectinator peers" if self.model.peers else ""))
 
     def filter_rows(self):
         selected = self.selected()
@@ -805,6 +849,8 @@ class MainWindow(QMainWindow):
         lines = [device.address, state, f"Last seen: {display_time(device.last_seen)}",
                  f"Last checked: {display_time(device.last_checked)}",
                  "Current-session scan result" if device.address in self.seen else "Saved service inventory; rescan to verify services."]
+        if peer := self.model.peers.get(device.address):
+            lines.append(f"Connectinator running: {peer.name}" + (f" · {peer.platform}" if peer.platform else ""))
         for title, value in (("Label", device.label), ("Hostname", device.hostname), ("MAC / ARP", device.mac)):
             if value:
                 lines.append(f"{title}: {value}")
@@ -881,7 +927,7 @@ class MainWindow(QMainWindow):
         if not device or port is None:
             return
         executable = self.settings.value("viewer/path", "") or find_viewer()
-        if not executable or not Path(executable).is_file():
+        if not executable or not Path(resolve_executable(executable)).is_file():
             if not self.viewer_settings():
                 return
             executable = self.settings.value("viewer/path", "")
@@ -916,6 +962,7 @@ class MainWindow(QMainWindow):
             self.stop_scan()
             event.ignore()
         else:
+            self.peer_discovery.stop()
             self.resolver.cancel()
             self.refresh_timer.stop()
             self.flush_updates()
@@ -932,7 +979,8 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Connectinator")
     app.setOrganizationName("Connectinator")
-    app.setFont(QFont("Segoe UI", 10))
+    if sys.platform == "win32":
+        app.setFont(QFont("Segoe UI", 10))  # Elsewhere keep the platform's native UI font.
     apply_theme(app)
     window = MainWindow()
     window.show()

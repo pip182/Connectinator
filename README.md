@@ -2,6 +2,8 @@
 
 A PySide6 desktop app for discovering IPv4 devices, inspecting common TCP services,
 and quickly connecting to VNC servers with an installed viewer. Icons use QtAwesome.
+It runs on Windows, macOS, and Linux, and copies running on the same network find
+each other automatically (see **Other computers running Connectinator**).
 
 ## Setup and launch
 
@@ -24,10 +26,42 @@ The environment has already been created for this checkout. To activate it optio
 .\.venv\Scripts\Activate.ps1
 ```
 
-Activation is unnecessary when using the full interpreter path above. On Linux/macOS,
-use `.venv/bin/python` instead of `.venv\Scripts\python.exe`.
+Activation is unnecessary when using the full interpreter path above.
 
-## Standalone Windows executable
+On Linux or macOS:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+./run.sh
+```
+
+`run.sh` launches with the project environment from any current directory. Linux
+desktops need Qt's usual X11/Wayland libraries (for example `libegl1` and
+`libxkbcommon0` on Debian/Ubuntu); most desktop installs already have them.
+
+## Other computers running Connectinator
+
+Every running copy announces itself on the local network and lists the others,
+so all machines running the app can see each other without scanning. Peers appear
+in the device table within a second of starting, marked **Connectinator peer** in
+the Discovery column, named by their computer name (a label you set still wins),
+and shown **Online** while they keep announcing. Choose **Connectinator peers** in
+the status filter to list only them. Their details show the computer name and OS.
+
+- Announcements are small UDP broadcasts on port **47823**, sent every five seconds
+  to each local subnet. A new copy says hello and existing copies answer it directly.
+  A copy that closes says goodbye; one that goes silent for ~17 seconds is dropped
+  from the peer list but stays in the saved inventory like any other device.
+- Allow the app through the firewall when Windows or macOS asks on first launch.
+  On Linux, open UDP 47823 if a firewall (for example `ufw allow 47823/udp`) is active.
+- Broadcasts don't cross routers or most VPNs (including Tailscale), so peers are
+  found on the same subnet only. Scan or add other subnets as usual.
+- Only the computer name, OS name, and a random per-launch ID are sent. Nothing about
+  devices, labels, favorites, or VNC credentials is shared. Turn it off with
+  **Settings → Find other computers running Connectinator**.
+
+## Standalone executables
 
 The single-file build is **dist/Connectinator.exe**. Copy just that file to a
 Windows x64 machine and double-click it; Python, a virtual environment, and the
@@ -41,12 +75,21 @@ To rebuild on Windows, run **build.bat**, or use:
 .venv\Scripts\python.exe scripts\build_exe.py
 ```
 
+The same script builds natively on Linux (`dist/Connectinator`, a single file) and
+macOS (`dist/Connectinator.app`); PyInstaller can't cross-compile, so build on each OS:
+
+```sh
+.venv/bin/python -m pip install -e ".[build]"
+.venv/bin/python scripts/build_exe.py
+```
+
 If an existing EXE is running, build alongside it without replacing it:
 `.venv\Scripts\python.exe scripts\build_exe.py --dist-dir dist/updated`.
 
 Build dependencies live in the optional `build` extra in `pyproject.toml`.
 The build runs a packaged self-test that renders the UI, checks icons, detects
-a fake loopback VNC server, and invokes the packaged ARP helper on loopback.
+a fake loopback VNC server, exchanges peer announcements on loopback, and (on
+Windows) invokes the packaged ARP helper on loopback.
 It writes `build/exe-self-test.json` and a UI image; no LAN scan is performed.
 To run it again: `dist\Connectinator.exe --self-test build\exe-self-test.json`.
 
@@ -68,7 +111,8 @@ settings rather than beside the executable.
    unverified VNC entries are guesses from the port number. Select an endpoint when a
    machine has multiple VNC servers, then click **Connect to VNC** or double-click its row.
 5. Use **Viewer settings** to select an installed VNC viewer if it wasn't detected.
-   TigerVNC is a suitable option. The default `host::port` syntax passes the exact TCP
+   TigerVNC is a suitable option on every platform. On macOS you can pick the viewer's
+   `.app` (TigerVNC Viewer and RealVNC VNC Viewer in Applications are detected). The default `host::port` syntax passes the exact TCP
    port; single-colon syntax is available for viewers that require it. Authentication
    happens in the viewer. Connectinator does not install a viewer or embed a VNC client.
 
@@ -149,6 +193,8 @@ guarantee that a particular VNC service is accepting connections or credentials.
 ```powershell
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+On Linux/macOS: `.venv/bin/python -m unittest discover -s tests -v`.
 
 Tests use loopback fake servers, mocked native ARP and DNS, mocked viewer launches,
 and an offscreen Qt interface; they do not scan the LAN. Project conventions and a

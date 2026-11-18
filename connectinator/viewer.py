@@ -2,15 +2,38 @@
 
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
 
 
+MAC_APPS = ("TigerVNC Viewer*.app", "VNC Viewer.app", "TightVNC*.app")
+
+
+def resolve_executable(path: str) -> str:
+    """Accept a macOS .app bundle by returning the program inside it."""
+    bundle = Path(path)
+    if bundle.suffix.lower() != ".app" or not bundle.is_dir():
+        return path
+    try:
+        with (bundle / "Contents" / "Info.plist").open("rb") as stream:
+            name = plistlib.load(stream).get("CFBundleExecutable") or bundle.stem
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        name = bundle.stem
+    return str(bundle / "Contents" / "MacOS" / str(name))
+
+
 def find_viewer() -> str:
-    for name in ("vncviewer", "vncviewer64", "tvnviewer"):
+    for name in ("vncviewer", "xtigervncviewer", "vncviewer64", "tvnviewer"):
         if executable := shutil.which(name):
             return executable
+    if sys.platform == "darwin":
+        for root in (Path("/Applications"), Path.home() / "Applications"):
+            for pattern in MAC_APPS:
+                for bundle in sorted(root.glob(pattern)):
+                    if Path(executable := resolve_executable(str(bundle))).is_file():
+                        return executable
     for key in ("ProgramFiles", "ProgramFiles(x86)"):
         root = os.environ.get(key)
         if not root:
@@ -27,6 +50,7 @@ def find_viewer() -> str:
 
 def viewer_command(executable: str, address: str, port: int, style: str = "Double colon",
                    view_only: bool = False) -> list[str]:
+    executable = resolve_executable(executable)
     if not Path(executable).is_file():
         raise ValueError("Choose an installed VNC viewer executable in Viewer settings.")
     separator = ":" if style == "Single colon" else "::"
