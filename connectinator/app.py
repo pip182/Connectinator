@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .scanner import COMMON_PORTS, VNC_PORTS, Device, Service, parse_ports, parse_targets, scan
+from .advanced import ADVANCED_PORTS, AdvancedReport, advanced_scan
 from .remote import (
     BROWSER_KINDS,
     CLIENT_KINDS,
@@ -132,12 +133,38 @@ class AvailabilityThread(QThread):
             self.error = str(exc)
 
 
+class AdvancedThread(QThread):
+    report = Signal(object)
+    update = Signal(object)
+    progress = Signal(int, int)
+    failed = Signal(str)
+
+    def __init__(self, address, timeout, parent=None, *, mac="", hostname=""):
+        super().__init__(parent)
+        self.address, self.timeout = address, timeout
+        self.mac, self.hostname = mac, hostname
+        self.cancel = threading.Event()
+        self.error = ""
+
+    def run(self):
+        try:
+            result = asyncio.run(advanced_scan(
+                self.address, self.timeout, self.cancel.is_set, self.progress.emit,
+                mac=self.mac, hostname=self.hostname, on_update=self.update.emit,
+            ))
+            self.report.emit(result)
+        except Exception as exc:
+            self.error = str(exc)
+            self.failed.emit(self.error)
+
+
 _GETTING_STARTED = (
     "1. Pick a network or enter Targets (IPv4, subnet, or range).\n"
     "2. Click Scan network. Open ports appear as services are found.\n"
     "3. Select a device, choose a Remote endpoint, and click Connect "
     "(or double-click the row, right-click, or press Ctrl+Enter).\n"
-    "4. Use Settings for timeouts, monitoring, and Remote client settings.\n"
+    "4. Right-click a row for Advanced scan: read-only banner, access, and risk checks.\n"
+    "5. Use Settings for timeouts, monitoring, and Remote client settings.\n"
     "Hover the ? icons for short tips; click them for longer explanations."
 )
 
@@ -265,13 +292,19 @@ class MainWindow(QMainWindow):
         self.settings = settings if settings is not None else QSettings("Connectinator", "Connectinator")
         self.worker: ScanThread | None = None
         self.availability_worker: AvailabilityThread | None = None
+        self.advanced_worker: AdvancedThread | None = None
         self.scan_after_monitor = False
+        self.advanced_after_monitor: str | None = None
         self.closing = False
         self.pending_devices: dict[str, Device] = {}
         self.pending_names: dict[str, str] = {}
         self.pending_progress = None
         self.pending_availability: dict[str, Availability] = {}
         self.pending_peers: dict[str, object] = {}  # address -> Peer, or None when it left
+        self.pending_advanced_report: AdvancedReport | None = None
+        self.pending_advanced_update = False
+        self.live_advanced_report: AdvancedReport | None = None
+        self.advanced_reports: dict[str, AdvancedReport] = {}
         self.dirty: set[str] = set()
         self.store = None
         self.scan_warnings: list[str] = []
@@ -834,17 +867,17 @@ class MainWindow(QMainWindow):
         if not self.monitor_enabled.isChecked():
             if self.availability_worker:
                 self.availability_worker.cancel.set()
-        elif not self.availability_worker and not self.worker:
+        elif not self.availability_worker and not self.worker and not self.advanced_worker:
             self.monitor_timer.start(0)
 
     def schedule_monitor(self):
-        if not self.closing and self.monitor_enabled.isChecked():
+        if not self.closing and not self.advanced_worker and self.monitor_enabled.isChecked():
             self.monitor_timer.start(int(self.monitor_interval.value() * 1000))
 
     @Slot()
     def start_monitor(self):
         self.monitor_timer.stop()
-        if self.closing or self.worker or self.availability_worker:
+        if self.closing or self.worker or self.availability_worker or self.advanced_worker:
             return
         self.flush_updates()
         if not self.devices:
@@ -879,6 +912,11 @@ class MainWindow(QMainWindow):
         self.check_button.setEnabled(True)
         if self.closing:
             self.close()
+            return
+        advanced_address = self.advanced_after_monitor
+        self.advanced_after_monitor = None
+        if advanced_address:
+            self.start_advanced_scan(advanced_address)
         elif self.scan_after_monitor:
             self.scan_after_monitor = False
             self.start_scan()
@@ -887,7 +925,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def start_scan(self):
-        if self.worker is not None:
+        if self.worker is not None or self.advanced_worker is not None:
+            self.status.setText("A scan is already running; stop it before starting another.")
             return
         if self.availability_worker:
             self.scan_after_monitor = True
@@ -950,6 +989,132 @@ class MainWindow(QMainWindow):
             self.worker.cancel.set()
             self.stop_button.setEnabled(False)
             self.status.setText("Stopping scan…")
+        elif self.advanced_worker:
+            self.advanced_worker.cancel.set()
+            self.stop_button.setEnabled(False)
+            self.status.setText("Stopping advanced scan…")
+
+    @Slot()
+    def start_advanced_scan(self, address: str | None = None):
+        if not address:
+            device = self.selected()
+            address = device.address if device else ""
+        if not address or address not in self.devices:
+            self.status.setText("Select a device before running an advanced scan.")
+            return
+        if self.worker is not None or self.advanced_worker is not None:
+            self.status.setText("A scan is already running; stop it before starting another.")
+            return
+        if self.availability_worker:
+            self.advanced_after_monitor = address
+            self.scan_after_monitor = False
+            self.availability_worker.cancel.set()
+            self.status.setText("Stopping availability check before the advanced scan…")
+            return
+        device = self.devices[address]
+        self.flush_updates()
+        self.resolver.cancel()
+        self.monitor_timer.stop()
+        self.pending_progress = None
+        self.pending_advanced_report = None
+        self.pending_advanced_update = False
+        self.live_advanced_report = None
+        self.advanced_reports.pop(address, None)
+        self.progress.setRange(0, len(ADVANCED_PORTS))
+        self.progress.setValue(0)
+        self.status.setText(f"Advanced read-only scan of {address} · {len(ADVANCED_PORTS)} ports…")
+        self.scan_button.setEnabled(False)
+        self.check_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.advanced_worker = AdvancedThread(
+            address, self.timeout.value(), self, mac=device.mac, hostname=device.hostname,
+        )
+        self.advanced_worker.progress.connect(self.scan_progress)
+        self.advanced_worker.update.connect(self.advanced_update)
+        self.advanced_worker.report.connect(self.advanced_report_ready)
+        self.advanced_worker.failed.connect(self.advanced_error)
+        self.advanced_worker.finished.connect(self.advanced_finished)
+        self.advanced_worker.start()
+
+    @Slot(object)
+    def advanced_report_ready(self, report: AdvancedReport):
+        self.pending_advanced_report = report
+
+    @Slot(object)
+    def advanced_update(self, report: AdvancedReport):
+        self.live_advanced_report = report
+        self.pending_advanced_update = True
+        self.flush_updates()
+
+    @Slot(str)
+    def advanced_error(self, error):
+        self.status.setText(f"Advanced scan failed: {error}")
+
+    @Slot()
+    def advanced_finished(self):
+        worker = self.advanced_worker
+        if worker is None:
+            return
+        self.flush_updates()
+        report = self.pending_advanced_report
+        self.pending_advanced_report = None
+        if report is not None:
+            self.advanced_reports[report.address] = report
+            self._merge_advanced_report(report)
+            self.select_address(report.address)
+            verb = "stopped" if report.partial or worker.cancel.is_set() else "complete"
+            self.status.setText(
+                f"Advanced scan {verb} for {report.address} · {len(report.services)} open ports · "
+                f"{len(report.findings)} observations."
+            )
+        elif worker.error:
+            self.status.setText(f"Advanced scan failed: {worker.error}")
+        else:
+            self.status.setText("Advanced scan stopped.")
+        self.advanced_worker = None
+        worker.deleteLater()
+        self.pending_advanced_update = False
+        self.live_advanced_report = None
+        self.show_device()
+        self.scan_button.setEnabled(True)
+        self.check_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        if self.closing:
+            self.close()
+        else:
+            self.schedule_monitor()
+
+    def _merge_advanced_report(self, report: AdvancedReport):
+        device = self.pending_devices.get(report.address) or self.devices.get(report.address)
+        if device is None:
+            return
+        found = {service.port: service for service in report.services}
+        checked = set(report.checked_ports)
+        services = {}
+        for service in device.services:
+            # A checked port with no result was closed or filtered during this run.
+            if service.port in checked and service.port not in found:
+                continue
+            services[service.port] = service
+        for port, service in found.items():
+            services[port] = replace(service, source="advanced")
+        now = utc_now()
+        updated = replace(
+            device,
+            services=[services[port] for port in sorted(services)],
+            complete=device.complete or all(
+                service.source == "advanced" or service.port in checked
+                for service in services.values()
+            ),
+            online=True if report.reachable else device.online,
+            last_checked=now,
+            last_seen=now if report.reachable else device.last_seen,
+        )
+        if report.reachable:
+            self.seen.add(report.address)
+        self.pending_devices[report.address] = updated
+        self.mark_dirty([report.address])
+        self.flush_updates()
 
     @Slot()
     def scan_finished(self):
@@ -1010,10 +1175,15 @@ class MainWindow(QMainWindow):
             completed, total = self.pending_progress
             self.pending_progress = None
             self.progress.setValue(completed)
-            if self.worker and not self.worker.cancel.is_set() and not self.worker.error:
+            if self.advanced_worker and not self.advanced_worker.cancel.is_set():
+                self.status.setText(f"Advanced scan · {completed} / {total} ports checked")
+            elif self.worker and not self.worker.cancel.is_set() and not self.worker.error:
                 suffix = " · finishing discovery" if completed == total else ""
                 self.status.setText(f"Scanning · {completed} / {total} hosts checked{suffix}")
         if not (self.pending_devices or self.pending_names or self.pending_availability or self.pending_peers):
+            if self.pending_advanced_update:
+                self.pending_advanced_update = False
+                self.show_device()
             return
         selected = self.selected()
         address = selected.address if selected else None
@@ -1071,6 +1241,7 @@ class MainWindow(QMainWindow):
                 self.table.setAutoScroll(True)
         scrollbar.setValue(scroll)
         self.update_summary()
+        self.pending_advanced_update = False
         self.show_device()
         self.mark_dirty(set(updates) | set(names) | set(availability) | {d.address for d in peer_devices})
         if self.resolve_names.isChecked() and not self.closing and not (self.worker and self.worker.cancel.is_set()):
@@ -1136,19 +1307,41 @@ class MainWindow(QMainWindow):
         for title, value in (("Label", device.label), ("Hostname", device.hostname), ("MAC / ARP", device.mac)):
             if value:
                 lines.append(f"{title}: {value}")
-        lines.append("Service scan complete." if device.complete else
-                     "Service scan still running…" if self.worker and not self.worker.cancel.is_set() else
-                     "Service scan incomplete; these are partial results.")
+        advanced_active = bool(self.advanced_worker and self.advanced_worker.address == device.address)
+        if advanced_active:
+            lines.append("Advanced scan running…")
+        elif device.complete:
+            lines.append("Service scan complete.")
+        elif self.worker and not self.worker.cancel.is_set():
+            lines.append("Service scan still running…")
+        else:
+            lines.append("Service scan incomplete; these are partial results.")
         lines.append("")
         for service in device.services:
             evidence = "protocol verified" if service.verified else "saved or inferred service; protocol currently unverified"
+            source = f" · {service.source}" if service.source and service.source != "scan" else ""
             kind = service_kind(service)
             connect = f" · connectable as {kind}" if kind else ""
-            lines.append(f"TCP {service.port} · {service.name} · {evidence}{connect}")
+            lines.append(f"TCP {service.port} · {service.name} · {evidence}{source}{connect}")
             if service.banner:
                 lines.append(f"  Greeting: {service.banner}")
         if not device.services:
             lines.append("No open scanned ports." if device.complete else "Checking TCP ports…")
+        report = self.live_advanced_report if advanced_active else self.advanced_reports.get(device.address)
+        if report:
+            lines.append("")
+            if advanced_active:
+                done = report.completed_ports or report.ports_scanned
+                lines.append(f"Advanced scan (in progress) · {done}/{report.ports_scanned} ports checked")
+            else:
+                lines.append(f"Advanced scan · {report.ports_scanned} ports checked"
+                             + (" · stopped early" if report.partial else ""))
+            if report.fingerprint:
+                lines.append(f"Fingerprint (low confidence): {report.fingerprint}")
+            for finding in report.findings:
+                location = f" · TCP {finding.port}" if finding.port else ""
+                lines.append(f"{finding.severity.upper()} · {finding.category} · {finding.title}{location}")
+                lines.append(f"  {finding.detail}")
         self.details.setPlainText("\n".join(lines))
         for service in device.connectable:
             kind = service_kind(service) or service.name
@@ -1183,6 +1376,10 @@ class MainWindow(QMainWindow):
         connect = menu.addAction("Connect")
         connect.setEnabled(bool(device.connectable))
         connect.triggered.connect(self.connect_remote)
+        advanced = menu.addAction("Advanced scan…")
+        advanced.setToolTip("Read-only banner, access, risk, and fingerprint checks on this device.")
+        advanced.triggered.connect(lambda _checked=False, address=device.address: self.start_advanced_scan(address))
+        menu.addSeparator()
         label = menu.addAction("Edit label…")
         label.triggered.connect(self.edit_label)
         favorite = device.address in self.favorites
@@ -1290,8 +1487,8 @@ class MainWindow(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(self, "Export scan results", "connectinator-results.json", "JSON (*.json)")
         if not filename:
             return
-        results = [
-            dict(
+        def export_entry(address, device):
+            entry = dict(
                 device.to_dict(),
                 observed_this_scan=address in self.seen,
                 favorite=address in self.favorites,
@@ -1301,6 +1498,12 @@ class MainWindow(QMainWindow):
                     if (service_kind(s))
                 ],
             )
+            if address in self.advanced_reports:
+                entry["advanced_scan"] = self.advanced_reports[address].to_dict()
+            return entry
+
+        results = [
+            export_entry(address, device)
             for address, device in sorted(self.devices.items(), key=lambda item: ipaddress.IPv4Address(item[0]))
         ]
         try:
@@ -1314,7 +1517,7 @@ class MainWindow(QMainWindow):
         self.monitor_timer.stop()
         if self.availability_worker:
             self.availability_worker.cancel.set()
-        if self.worker is not None or self.availability_worker is not None:
+        if self.worker is not None or self.availability_worker is not None or self.advanced_worker is not None:
             self.closing = True
             self.stop_scan()
             event.ignore()

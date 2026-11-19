@@ -2,17 +2,19 @@ import os
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from pathlib import Path
+import json
 import socketserver
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from connectinator.app import MainWindow
+from connectinator.advanced import AdvancedReport, Finding
 from connectinator.scanner import Device, Service
 from connectinator.monitor import Availability
 
@@ -33,11 +35,13 @@ class AppTests(unittest.TestCase):
     def tearDown(self):
         self.window.close()
         deadline = time.monotonic() + 3
-        while (self.window.worker is not None or self.window.availability_worker is not None) and time.monotonic() < deadline:
+        while (self.window.worker is not None or self.window.availability_worker is not None
+               or self.window.advanced_worker is not None) and time.monotonic() < deadline:
             self.app.processEvents()
             time.sleep(0.01)
         self.assertIsNone(self.window.worker, "Background scan did not stop")
         self.assertIsNone(self.window.availability_worker, "Availability check did not stop")
+        self.assertIsNone(self.window.advanced_worker, "Advanced scan did not stop")
         self.window.deleteLater()
         self.app.processEvents()
         del self.window
@@ -325,3 +329,113 @@ class AppTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertIsNone(self.window.worker)
             self.assertTrue(self.window.closing)
+
+    def test_context_menu_offers_advanced_scan(self):
+        self.window.add_device(Device("10.0.0.30", [Service(22, "SSH", True)]))
+        self.select("10.0.0.30")
+        index = self.window.table.currentIndex()
+        position = self.window.table.visualRect(index).center()
+        actions = []
+        with patch("connectinator.app.QMenu") as menu_class:
+            menu = menu_class.return_value
+
+            def add_action(text):
+                action = MagicMock()
+                action.text.return_value = text
+                actions.append(action)
+                return action
+
+            menu.addAction.side_effect = add_action
+            self.window.table_context_menu(position)
+        self.assertIn("Advanced scan…", [action.text() for action in actions])
+
+    def test_advanced_report_updates_table_details_and_export(self):
+        self.window.add_device(Device("10.0.0.30", [Service(22, "SSH", False)]))
+        self.select("10.0.0.30")
+        report = AdvancedReport(
+            "10.0.0.30",
+            services=[Service(22, "SSH", True, "SSH-2.0-OpenSSH_9.6"),
+                      Service(443, "HTTPS", True, "HTTP/1.1 200 OK")],
+            findings=[Finding("Access", "VNC advertises unauthenticated access",
+                              "RFB advertised None.", 5900, "warning")],
+            fingerprint="TTL suggests a Linux/macOS/Unix-like host",
+            ports_scanned=2,
+            checked_ports=(22, 443),
+            completed_ports=2,
+        )
+        self.window.advanced_reports[report.address] = report
+        self.window._merge_advanced_report(report)
+        self.window.flush_updates()
+        self.assertIn(443, {service.port for service in self.window.devices[report.address].services})
+        self.assertTrue(self.window.devices[report.address].services[0].verified)
+        self.assertEqual(self.window.devices[report.address].services[0].source, "advanced")
+        self.window.show_device()
+        self.assertIn("Advanced scan · 2 ports checked", self.window.details.toPlainText())
+        self.assertIn("· advanced", self.window.details.toPlainText())
+        self.assertIn("VNC advertises unauthenticated access", self.window.details.toPlainText())
+
+        output = Path(self.directory.name) / "export.json"
+        with patch("connectinator.app.QFileDialog.getSaveFileName", return_value=(str(output), "")):
+            self.window.export_results()
+        exported = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(exported[0]["advanced_scan"]["findings"][0]["severity"], "warning")
+        self.assertEqual(exported[0]["advanced_scan"]["ports_scanned"], 2)
+
+    def test_advanced_merge_respects_checked_port_coverage(self):
+        address = "10.0.0.40"
+        self.window.add_device(Device(address, [
+            Service(22, "SSH", True), Service(80, "HTTP", True), Service(9999, "Unknown", False),
+        ], complete=False))
+        self.select(address)
+        report = AdvancedReport(
+            address,
+            services=[Service(22, "SSH", True, "SSH-2.0")],
+            checked_ports=(22, 80),
+            completed_ports=2,
+            ports_scanned=2,
+        )
+        self.window._merge_advanced_report(report)
+        self.window.flush_updates()
+        device = self.window.devices[address]
+        self.assertEqual({service.port for service in device.services}, {22, 9999})
+        self.assertFalse(device.complete)  # 9999 was never checked.
+        self.assertEqual(next(s for s in device.services if s.port == 22).source, "advanced")
+
+        second = AdvancedReport(
+            address,
+            services=[Service(9999, "Unknown", True)],
+            checked_ports=(9999,),
+            completed_ports=1,
+            ports_scanned=1,
+        )
+        self.window._merge_advanced_report(second)
+        self.window.flush_updates()
+        self.assertTrue(self.window.devices[address].complete)
+
+    def test_advanced_update_shows_live_progress(self):
+        address = "10.0.0.50"
+        self.window.add_device(Device(address, [Service(22, "SSH", False)]))
+        self.select(address)
+        snapshot = AdvancedReport(
+            address,
+            services=[Service(22, "SSH", True, "SSH-2.0", "advanced")],
+            findings=[Finding("Access", "Old SSH version in banner", "detail", 22, "note")],
+            ports_scanned=4,
+            completed_ports=2,
+            checked_ports=(22,),
+            partial=True,
+        )
+        worker = MagicMock()
+        worker.address = address
+        self.window.advanced_worker = worker
+        try:
+            self.window.advanced_update(snapshot)
+            self.window.flush_updates()
+            text = self.window.details.toPlainText()
+            self.assertIn("Advanced scan running…", text)
+            self.assertIn("Advanced scan (in progress) · 2/4 ports checked", text)
+            self.assertIn("Old SSH version in banner", text)
+        finally:
+            self.window.advanced_worker = None
+            self.window.live_advanced_report = None
+            self.window.pending_advanced_update = False

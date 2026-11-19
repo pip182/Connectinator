@@ -13,6 +13,7 @@ PySide6 desktop app for IPv4 device/service discovery and launching installed re
 ## Map
 - `connectinator/app.py`: Qt interface, workers, settings, export.
 - `connectinator/scanner.py`: Qt-free async probes, target parsing, scan cancellation.
+- `connectinator/advanced.py`: read-only per-device extended scan (banners, access/risk observations, low-confidence fingerprint).
 - `connectinator/discovery.py`: Windows ARP helper; `names.py`: bounded Qt reverse DNS.
 - `connectinator/inventory.py`: cached table model and sorting/filtering proxy.
 - `connectinator/peers.py`: UDP broadcast beacons so running instances list each other (event-driven QUdpSocket).

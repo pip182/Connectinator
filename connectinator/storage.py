@@ -31,7 +31,8 @@ class InventoryStore:
             try:
                 address = str(ipaddress.IPv4Address(address))
                 data = json.loads(payload)
-                services = [Service(int(s["port"]), str(s["name"]), False, str(s.get("banner", "")))
+                services = [Service(int(s["port"]), str(s["name"]), False,
+                                    str(s.get("banner", "")), str(s.get("source", "")))
                             for s in data.get("services", []) if 1 <= int(s["port"]) <= 65535]
                 devices.append(Device(address, services, hostname=str(data.get("hostname", "")),
                                       label=str(data.get("label", "")), mac=str(data.get("mac", "")),

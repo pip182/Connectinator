@@ -41,6 +41,7 @@ class Service:
     name: str
     verified: bool = False
     banner: str = ""
+    source: str = ""  # scan, advanced, saved, or legacy empty
 
 
 @dataclass
@@ -142,11 +143,11 @@ async def probe(address: str, port: int, timeout: float, greeting_timeout: float
             pass
         decoded = banner.decode("ascii", errors="replace").strip()
         if re.fullmatch(rb"RFB \d{3}\.\d{3}\n", banner):
-            return Service(port, "VNC", True, decoded)
+            return Service(port, "VNC", True, decoded, "scan")
         if banner.startswith(b"SSH-"):
-            return Service(port, "SSH", True, decoded)
+            return Service(port, "SSH", True, decoded, "scan")
         name = SERVICES.get(port, "VNC" if 5900 <= port <= 5999 else "Unknown TCP")
-        return Service(port, name, False, decoded)
+        return Service(port, name, False, decoded, "scan")
     except (TimeoutError, OSError):
         return None
     finally:

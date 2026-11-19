@@ -123,6 +123,14 @@ settings rather than beside the executable.
    browser. Favorites remember both protocol and port (for example `SSH:22`). Authentication
    happens in the client; Connectinator neither installs clients nor stores passwords.
 
+Right-click a device and choose **Advanced scan…** for a read-only deep check of that IP.
+It probes an extended port set, reads short banners, and reports access and risk
+observations (for example VNC without authentication, plaintext Telnet/FTP, or old
+server versions) plus a low-confidence device hint. Findings appear in the details
+pane while the scan runs and are merged into the service table and exported as
+`advanced_scan` when it finishes. No credentials,
+login attempts, or exploit payloads are used; only scan devices you are authorized to inspect.
+
 Save a selected device as a favorite for later connections. Favorites retain addresses
 and protocol/port refs (for example `SSH:22`), and appear after restart as unverified
 until scanned again. Filter by address, service, port, remote endpoints, or favorites.
